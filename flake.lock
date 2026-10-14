@@ -2120,11 +2120,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1792019609,
-        "narHash": "sha256-0XU+JO4owMjOqphuey8tD1wco8AyAdVcCXEKHZeEeok=",
+        "lastModified": 1792022039,
+        "narHash": "sha256-pxuPhc34EcQcBgdB7UeRQQAb+LJEfR1k9CeuKqZE2D0=",
         "owner": "logos-co",
         "repo": "logos-qr-scanner-module",
-        "rev": "18f8f6c43035e431157da6dcb09aa853c61ac2ef",
+        "rev": "3e2f7e8def39d4f0e89bf887d500482c58950820",
         "type": "github"
       },
       "original": {

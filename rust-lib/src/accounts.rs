@@ -229,13 +229,43 @@ pub fn offered(
             Some(r) => out.push(r?),
             None => {
                 return Err(format!(
-                    "the code holds no {} account",
-                    family_name(*family)
+                    "the code holds no {} account; it holds {}",
+                    family_name(*family),
+                    held(found)
                 ))
             }
         }
     }
     Ok(out)
+}
+
+/// What a code holds, for a person who showed the wrong one: each key's kind and path.
+fn held(found: &Accounts) -> String {
+    let path = |k: &HdKey| {
+        k.origin
+            .as_ref()
+            .map_or("?".into(), |o| path_string(&o.components))
+    };
+    let mut parts: Vec<String> = found
+        .outputs
+        .iter()
+        .map(|o| {
+            let kind = match o.script {
+                Script::Wpkh => "native segwit",
+                Script::Tr => "taproot",
+                Script::ShWpkh => "nested segwit",
+                Script::Pkh => "legacy",
+                Script::Other => "another script",
+            };
+            format!("{kind} at {}", path(&o.key))
+        })
+        .collect();
+    parts.extend(found.keys.iter().map(|k| format!("a key at {}", path(k))));
+    if parts.is_empty() {
+        "no keys".into()
+    } else {
+        parts.join(", ")
+    }
 }
 
 pub fn family_name(f: Family) -> &'static str {
@@ -339,6 +369,7 @@ mod tests {
         a.outputs.clear();
         let e = offered(&a, &[Family::BitcoinTaproot], "generic", None).unwrap_err();
         assert!(e.contains("taproot"), "{e}");
+        assert!(e.contains("a key at m/44'/60'/0'"), "{e}");
     }
 
     #[test]
