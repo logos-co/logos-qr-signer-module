@@ -1,0 +1,22 @@
+{
+  "name": "qr_signer_module",
+  "version": "0.1.0",
+  "description": "QR signer: air-gapped wallets that sign over animated QR codes (BC-UR, ERC-4527), such as the Keycard Shell, Keystone, Passport and Jade. Shows each request and reads the answer through qr_scanner_module. Holds no secret.",
+  "author": "Logos Core Team",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "wallet",
+  "main": "qr_signer_module_plugin",
+  "dependencies": ["qr_scanner_module"],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": { "crate": "rust-lib", "trait": "QrSignerModule", "source": "src/glue.rs" }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}

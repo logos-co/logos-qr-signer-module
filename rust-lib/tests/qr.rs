@@ -1,0 +1,207 @@
+//! The QR signer end to end against the emulated wallet, with the scanner in process: codes pass as
+//! text, so this covers the signer and the UR types; the helper and its decoders have their own.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use logos_signer_interface::conformance::{self, Fixture};
+use logos_signer_interface::{ErrorCode, Family, JobState, Payload, SignRequest, Signer};
+use qr_signer_module::emulator::Emulator;
+use qr_signer_module::signer::{Events, QrSigner, ScanPoll, ScanRequest, Scanner, Show};
+use qr_signer_module::store::Store;
+
+/// Hands the emulator what the window would show, and the camera what the emulator holds up.
+struct InProcess {
+    emu: Emulator,
+    sessions: Mutex<HashMap<String, Vec<String>>>,
+    stopped: Mutex<u32>,
+}
+
+impl Scanner for InProcess {
+    fn start(
+        &self,
+        _: &str,
+        show: Option<Show<'_>>,
+        _: bool,
+        _: &str,
+    ) -> Result<(String, String), String> {
+        let texts = match show {
+            Some(s) => self
+                .emu
+                .answer(s.parts)
+                .filter(|_| !self.emu.silent)
+                .unwrap_or_default(),
+            None => self.emu.accounts_code(),
+        };
+        let mut sessions = self.sessions.lock().unwrap();
+        let id = format!("s{}", sessions.len());
+        sessions.insert(id.clone(), texts);
+        Ok((id, "t".into()))
+    }
+
+    fn poll(&self, session: &str, _: &str) -> Result<ScanPoll, String> {
+        let texts = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(session)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        Ok(ScanPoll {
+            state: "running".into(),
+            texts,
+            error: None,
+        })
+    }
+
+    fn progress(&self, _: &str, _: &str, _: usize, _: usize) {}
+
+    fn stop(&self, session: &str, _: &str) {
+        self.sessions.lock().unwrap().remove(session);
+        *self.stopped.lock().unwrap() += 1;
+    }
+}
+
+struct Quiet;
+
+impl Events for Quiet {
+    fn sign_progress(&self, _: &str, _: JobState) {}
+    fn accounts_changed(&self, _: usize) {}
+}
+
+fn signer(emu: Emulator) -> (QrSigner, Arc<InProcess>) {
+    let scanner = Arc::new(InProcess {
+        emu,
+        sessions: Mutex::new(HashMap::new()),
+        stopped: Mutex::new(0),
+    });
+    (
+        QrSigner::with_patience(
+            scanner.clone(),
+            Store::new(),
+            Box::new(Quiet),
+            Duration::from_secs(20),
+        ),
+        scanner,
+    )
+}
+
+fn scan_all(s: &QrSigner) {
+    let job = s
+        .scan_accounts(ScanRequest {
+            families: vec![Family::Evm, Family::Bitcoin, Family::BitcoinTaproot],
+            label: None,
+            profile: None,
+        })
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let added = s.add_status(&job).unwrap();
+        match added.state {
+            "done" => return assert_eq!(added.accounts.len(), 3),
+            "failed" => panic!("{:?}", added.error),
+            _ => assert!(Instant::now() < until, "still scanning"),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait(s: &mut QrSigner, job: &str) -> JobState {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let st = s.status(job).unwrap().state;
+        if st.is_final() || Instant::now() > until {
+            return st;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn accounts_come_from_the_wallets_code() {
+    let (s, _) = signer(Emulator::default());
+    scan_all(&s);
+    let offered = s.offered();
+    assert!(
+        offered.iter().all(|o| o.profile == "keycard_shell"),
+        "the code names a Keycard Shell"
+    );
+    assert_eq!(
+        offered[0].account.id,
+        "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+    );
+    assert!(offered[1].account.id.ends_with("-84-1-0"));
+    assert!(offered[2]
+        .account
+        .xpub
+        .as_deref()
+        .unwrap()
+        .starts_with("tpub"));
+}
+
+#[test]
+fn conformance() {
+    let (mut s, _) = signer(Emulator::default());
+    scan_all(&s);
+    // The emulated wallet answers by itself: driving it is only giving it time.
+    conformance::run(
+        &mut s,
+        &Fixture {
+            secret: None,
+            wrong_secret: None,
+        },
+        &mut |_, _| std::thread::sleep(Duration::from_millis(100)),
+    );
+}
+
+#[test]
+fn a_cancelled_request_closes_the_session() {
+    let (mut s, scanner) = signer(Emulator {
+        silent: true,
+        ..Emulator::default()
+    });
+    scan_all(&s);
+    let account = s.offered()[0].account.id.clone();
+    let job = s
+        .sign(SignRequest {
+            account,
+            payload: Payload::EvmMessage {
+                message: hex::encode("hi"),
+            },
+            secret: None,
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    s.cancel(&job).unwrap();
+    assert_eq!(wait(&mut s, &job), JobState::Cancelled);
+    let until = Instant::now() + Duration::from_secs(5);
+    while *scanner.stopped.lock().unwrap() < 2 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        *scanner.stopped.lock().unwrap(),
+        2,
+        "the scan and the request each closed their session"
+    );
+}
+
+#[test]
+fn what_the_wallet_cant_take_is_refused_before_it_is_shown() {
+    let (mut s, scanner) = signer(Emulator::default());
+    scan_all(&s);
+    let account = s.offered()[0].account.id.clone();
+    let e = s
+        .sign(SignRequest {
+            account,
+            payload: Payload::EvmTransaction {
+                chain_id: 1 << 40,
+                tx: "02c0".into(),
+            },
+            secret: None,
+        })
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Unsupported);
+    assert!(e.message.contains("Keycard Shell"), "{}", e.message);
+    assert!(scanner.sessions.lock().unwrap().is_empty());
+}
