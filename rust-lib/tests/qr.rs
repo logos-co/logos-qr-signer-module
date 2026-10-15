@@ -2,6 +2,7 @@
 //! text, so this covers the signer and the UR types; the helper and its decoders have their own.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,8 @@ struct InProcess {
     presenter: Option<u8>,
     /// Each start's largest version allowed.
     shown: Mutex<Vec<u8>>,
+    /// The wallet's account code is out of the camera's sight.
+    hidden: AtomicBool,
 }
 
 impl Scanner for InProcess {
@@ -44,6 +47,7 @@ impl Scanner for InProcess {
                     .filter(|_| !self.emu.silent)
                     .unwrap_or_default()
             }
+            None if self.hidden.load(Ordering::SeqCst) => Vec::new(),
             None => self.emu.accounts_code(),
         };
         let mut sessions = self.sessions.lock().unwrap();
@@ -94,6 +98,7 @@ fn signer_presented(emu: Emulator, presenter: Option<u8>) -> (QrSigner, Arc<InPr
         stopped: Mutex::new(0),
         presenter,
         shown: Mutex::new(Vec::new()),
+        hidden: AtomicBool::new(false),
     });
     (
         QrSigner::with_patience(
@@ -106,24 +111,33 @@ fn signer_presented(emu: Emulator, presenter: Option<u8>) -> (QrSigner, Arc<InPr
     )
 }
 
-fn scan_all(s: &QrSigner) {
-    let job = s
-        .scan_accounts(ScanRequest {
-            families: vec![Family::Evm, Family::Bitcoin, Family::BitcoinTaproot],
-            label: None,
-            profile: None,
-        })
-        .unwrap();
+fn all_families() -> ScanRequest {
+    ScanRequest {
+        families: vec![Family::Evm, Family::Bitcoin, Family::BitcoinTaproot],
+        label: None,
+        profile: None,
+    }
+}
+
+/// A scan's state once it is no longer scanning.
+fn scanned(s: &QrSigner, job: &str) -> &'static str {
     let until = Instant::now() + Duration::from_secs(10);
     loop {
-        let added = s.add_status(&job).unwrap();
-        match added.state {
-            "done" => return assert_eq!(added.accounts.len(), 3),
-            "failed" => panic!("{:?}", added.error),
-            _ => assert!(Instant::now() < until, "still scanning"),
+        let state = s.add_status(job).unwrap().state;
+        if state != "scanning" {
+            return state;
         }
+        assert!(Instant::now() < until, "still scanning");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn scan_all(s: &QrSigner) {
+    let job = s.scan_accounts(all_families()).unwrap();
+    let state = scanned(s, &job);
+    let added = s.add_status(&job).unwrap();
+    assert_eq!(state, "done", "{:?}", added.error);
+    assert_eq!(added.accounts.len(), 3);
 }
 
 fn wait(s: &mut QrSigner, job: &str) -> JobState {
@@ -192,6 +206,11 @@ fn a_cancelled_request_closes_the_session() {
         })
         .unwrap();
     std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        s.scan_accounts(all_families()).unwrap_err().code,
+        ErrorCode::Busy,
+        "a signature isn't stopped by a scan"
+    );
     s.cancel(&job).unwrap();
     assert_eq!(wait(&mut s, &job), JobState::Cancelled);
     let until = Instant::now() + Duration::from_secs(5);
@@ -203,6 +222,31 @@ fn a_cancelled_request_closes_the_session() {
         2,
         "the scan and the request each closed their session"
     );
+}
+
+#[test]
+fn a_scan_stops_when_asked() {
+    let (s, scanner) = signer(Emulator::default());
+    scanner.hidden.store(true, Ordering::SeqCst);
+    let job = s.scan_accounts(all_families()).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(s.cancel_scan(&job));
+    assert_eq!(scanned(&s, &job), "cancelled");
+    assert!(!s.cancel_scan(&job), "it is over");
+    assert_eq!(*scanner.stopped.lock().unwrap(), 1, "its session closed");
+}
+
+#[test]
+fn a_new_scan_replaces_one_still_waiting() {
+    let (s, scanner) = signer(Emulator::default());
+    scanner.hidden.store(true, Ordering::SeqCst);
+    let first = s.scan_accounts(all_families()).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    scanner.hidden.store(false, Ordering::SeqCst);
+    let second = s.scan_accounts(all_families()).unwrap();
+    assert_eq!(s.add_status(&first).unwrap().state, "cancelled");
+    assert_eq!(scanned(&s, &second), "done");
+    assert!(!s.cancel_scan(&first));
 }
 
 #[test]

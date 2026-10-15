@@ -245,6 +245,8 @@ struct Shared {
     events: Box<dyn Events>,
     seq: AtomicU64,
     busy: AtomicBool,
+    /// The account scan running, if one is, and what stops it.
+    scan: Mutex<Option<(String, Arc<AtomicBool>)>>,
     patience: Duration,
 }
 
@@ -265,6 +267,8 @@ pub struct QrSigner {
 
 /// How long a person may take to scan, confirm on the wallet and show its answer.
 pub const PATIENCE: Duration = Duration::from_secs(600);
+/// How long an account scan waits for a code: there is nothing to confirm on the wallet.
+pub const SCAN_PATIENCE: Duration = Duration::from_secs(180);
 
 impl QrSigner {
     pub fn new(scanner: Arc<dyn Scanner>, store: Store, events: Box<dyn Events>) -> Self {
@@ -286,6 +290,7 @@ impl QrSigner {
                 events,
                 seq: AtomicU64::new(0),
                 busy: AtomicBool::new(false),
+                scan: Mutex::new(None),
                 patience,
             }),
         }
@@ -301,16 +306,28 @@ impl QrSigner {
         lock(&self.shared.store).list().to_vec()
     }
 
-    /// Read a wallet's account code and offer the accounts of these families.
+    /// Read a wallet's account code and offer the accounts of these families. An account scan
+    /// still running gives way: it is the same person trying again. A signature in progress doesn't.
     pub fn scan_accounts(&self, req: ScanRequest) -> Result<String> {
         if req.families.is_empty() {
             return Err(err(ErrorCode::Invalid, "no families asked for"));
         }
+        let busy = || err(ErrorCode::Busy, "the QR signer is already reading a code");
         if self.shared.busy.swap(true, Ordering::SeqCst) {
-            return Err(err(
-                ErrorCode::Busy,
-                "the QR signer is already reading a code",
-            ));
+            let running = lock(&self.shared.scan)
+                .as_ref()
+                .map(|(_, stop)| stop.clone());
+            let Some(stop) = running else {
+                return Err(busy());
+            };
+            stop.store(true, Ordering::SeqCst);
+            let until = Instant::now() + Duration::from_secs(3);
+            while self.shared.busy.swap(true, Ordering::SeqCst) {
+                if Instant::now() > until {
+                    return Err(busy());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
         let id = format!("add_{}", self.shared.seq.fetch_add(1, Ordering::SeqCst) + 1);
         lock(&self.shared.adds).insert(
@@ -321,15 +338,20 @@ impl QrSigner {
                 error: None,
             },
         );
+        let stop = Arc::new(AtomicBool::new(false));
+        *lock(&self.shared.scan) = Some((id.clone(), stop.clone()));
         let shared = self.shared.clone();
         let job = id.clone();
         std::thread::spawn(move || {
-            let outcome = shared.add(&req);
-            shared.busy.store(false, Ordering::SeqCst);
-            let added = match outcome {
+            let added = match shared.add(&req, &stop) {
                 Ok(accounts) => Added {
                     state: "done",
                     accounts,
+                    error: None,
+                },
+                Err(_) if stop.load(Ordering::SeqCst) => Added {
+                    state: "cancelled",
+                    accounts: Vec::new(),
                     error: None,
                 },
                 Err(e) => Added {
@@ -338,9 +360,28 @@ impl QrSigner {
                     error: Some(e.message),
                 },
             };
-            lock(&shared.adds).insert(job, added);
+            lock(&shared.adds).insert(job.clone(), added);
+            // The outcome first, then the scan, then the scanner: whoever replaces it finds all said.
+            {
+                let mut scan = lock(&shared.scan);
+                if scan.as_ref().is_some_and(|(id, _)| *id == job) {
+                    *scan = None;
+                }
+            }
+            shared.busy.store(false, Ordering::SeqCst);
         });
         Ok(id)
+    }
+
+    /// Stop an account scan. Whether it was still running.
+    pub fn cancel_scan(&self, job: &str) -> bool {
+        match lock(&self.shared.scan).as_ref() {
+            Some((id, stop)) if id == job => {
+                stop.store(true, Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn add_status(&self, job: &str) -> Option<Added> {
@@ -392,7 +433,8 @@ impl Shared {
         show: Option<Request<'_>>,
         hint: &str,
         expect: &[&'static str],
-        job: Option<&str>,
+        stopped: &dyn Fn() -> bool,
+        patience: Duration,
     ) -> Result<Ended> {
         let mut version = show.map_or(0, |r| r.profile.max_version);
         let mut parts = match show {
@@ -418,14 +460,10 @@ impl Shared {
             expected: 0,
         };
         let outcome = loop {
-            if job.is_some_and(|j| {
-                lock(&self.jobs)
-                    .status(j)
-                    .is_ok_and(|s| s.state == JobState::Cancelled)
-            }) {
+            if stopped() {
                 break Ok(Ended::Cancelled);
             }
-            if started.elapsed() > self.patience {
+            if started.elapsed() > patience {
                 break Err(err(
                     ErrorCode::Unavailable,
                     "no answer from the wallet in time",
@@ -485,7 +523,7 @@ impl Shared {
         outcome
     }
 
-    fn add(&self, req: &ScanRequest) -> Result<Vec<Account>> {
+    fn add(&self, req: &ScanRequest, stop: &AtomicBool) -> Result<Vec<Account>> {
         let expect = [
             "crypto-account",
             "crypto-multi-accounts",
@@ -493,7 +531,10 @@ impl Shared {
             "crypto-output",
         ];
         let hint = "Show your wallet's account code (on a Keycard Shell: Connect software wallet)";
-        let Ended::Answer(t, cbor) = self.session("Add a QR wallet", None, hint, &expect, None)?
+        let stopped = || stop.load(Ordering::SeqCst);
+        let patience = self.patience.min(SCAN_PATIENCE);
+        let Ended::Answer(t, cbor) =
+            self.session("Add a QR wallet", None, hint, &expect, &stopped, patience)?
         else {
             return Err(err(ErrorCode::Refused, "cancelled"));
         };
@@ -538,7 +579,12 @@ impl Shared {
             Some(show),
             "",
             &[expect],
-            Some(job),
+            &|| {
+                lock(&self.jobs)
+                    .status(job)
+                    .is_ok_and(|s| s.state == JobState::Cancelled)
+            },
+            self.patience,
         )?
         else {
             return Err(err(ErrorCode::Refused, "cancelled"));

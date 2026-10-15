@@ -33,6 +33,8 @@ pub trait QrSignerModule: Send + Sync + 'static {
     fn scan_accounts(&self, params_json: String) -> String;
     /// A scan's progress: `{ ok, job, state, accounts, error? }`.
     fn add_status(&self, job: String) -> String;
+    /// Stop a scan: `{ ok, cancelled }`, whether it was still running.
+    fn cancel_scan(&self, job: String) -> String;
     /// Stop offering an account: `{ ok, removed }`. Nothing on the wallet changes.
     fn remove_account(&self, id: String) -> String;
     /// Name an account for apps; a blank name clears it: `{ ok, renamed }`.
@@ -241,6 +243,10 @@ impl QrSignerModule for QrSignerModuleImpl {
             }
             None => err(format!("no scan {job}")),
         }
+    }
+
+    fn cancel_scan(&self, job: String) -> String {
+        json!({ "ok": true, "cancelled": self.qr.cancel_scan(&job) }).to_string()
     }
 
     fn remove_account(&self, id: String) -> String {

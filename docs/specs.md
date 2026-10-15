@@ -48,13 +48,17 @@ A job stays `confirm_on_device` while the person scans the codes, confirms on th
 up to the camera, for at most 10 minutes. Cancelling it, or pressing Cancel in the Logos QR window, closes
 the scanner's session.
 
+An account scan waits at most 3 minutes for the wallet's code. A new `scan_accounts` stops one still
+running, since it is the same person trying again; a signature in progress answers `busy` instead.
+
 For the app:
 
 | Method | Parameters | Answer |
 |---|---|---|
 | `profiles` | | `{ ok, profiles: [{ name, label }] }` |
 | `scan_accounts` | `{ families, label?, profile? }` | `{ ok, job }`. Reads the wallet's account code and offers an account of each family it holds: `evm`, `bitcoin` (native segwit, BIP84) and `bitcoin_taproot` (BIP86) |
-| `add_status` | `job` | `{ ok, job, state, accounts, error? }`, `state` being `scanning`, `done` or `failed` |
+| `add_status` | `job` | `{ ok, job, state, accounts, error? }`, `state` being `scanning`, `done`, `failed` or `cancelled` |
+| `cancel_scan` | `job` | `{ ok, cancelled }`, whether the scan was still running |
 | `remove_account` | `id` | `{ ok, removed }`. Nothing on the wallet changes |
 | `rename_account` | `id, label` | `{ ok, renamed }`. The name apps see, up to 80 characters; blank clears it |
 | `wallets` | | `{ ok, wallets: [{ fingerprint, profile, label }] }`: each wallet accounts came from, by master fingerprint, and the profile it follows |
