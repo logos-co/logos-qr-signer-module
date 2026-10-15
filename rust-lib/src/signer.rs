@@ -532,11 +532,11 @@ impl Shared {
             cbor: &cbor,
             profile: &p,
         };
-        let hint = "Scan these codes with your wallet and confirm on it, then hold its answer up to the camera";
+        // The scanner words each step itself: the request with the camera off, then the answer.
         let Ended::Answer(t, answer) = self.session(
             "Sign with your QR wallet",
             Some(show),
-            hint,
+            "",
             &[expect],
             Some(job),
         )?

@@ -1,11 +1,13 @@
 //! A QR wallet in software, for tests and doctests: the other end of the QR helper's fake mode. It
-//! reads the codes the helper would show, signs with the signer interface's mock keys, and holds its
-//! answer up to the "camera" as pictures of QR codes. Asked to scan with nothing shown, it shows its
-//! accounts, as a wallet's connect screen does.
+//! reads the codes the helper would show, signs with the signer interface's mock keys, presses the
+//! window's button as a person would, and holds its answer up to the "camera" as pictures of QR codes.
+//! Asked to scan with nothing shown, it shows its accounts, as a wallet's connect screen does.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
@@ -52,8 +54,8 @@ struct Shown {
 #[derive(Deserialize)]
 struct Line {
     show: Option<Shown>,
-    #[serde(default)]
-    scan: bool,
+    /// The camera turned on or off.
+    scan: Option<bool>,
 }
 
 /// A frame as a camera would see it: 4 pixels a module, with the quiet zone.
@@ -263,43 +265,56 @@ impl Emulator {
     /// One helper's session: what it shows is read, and once it scans, the answer is held up over
     /// and over until it hangs up.
     fn session(&self, stream: TcpStream) {
-        let Ok(mut writer) = stream.try_clone() else {
+        let Ok(writer) = stream.try_clone() else {
             return;
         };
+        // One writer for presses and pictures, so a press never lands inside a picture.
+        let writer = Arc::new(Mutex::new(writer));
+        let on = Arc::new(AtomicBool::new(false));
         let mut shown = Vec::new();
         for line in BufReader::new(stream).lines() {
             let Ok(line) = line else { return };
             let Ok(l) = serde_json::from_str::<Line>(&line) else {
                 continue;
             };
-            if let Some(s) = l.show {
+            if let Some(s) = l.show.filter(|s| !s.frames.is_empty()) {
                 shown = read_frames(&s.frames);
-            }
-            if !l.scan {
-                continue;
-            }
-            let codes = if shown.is_empty() {
-                Some(self.accounts_code())
-            } else {
-                self.answer(&shown)
-            };
-            let (Some(codes), false) = (codes, self.silent) else {
-                continue;
-            };
-            let Ok(mut w) = writer.try_clone() else {
-                return;
-            };
-            std::thread::spawn(move || loop {
-                for text in &codes {
-                    let (cw, ch, px) = text_raster(text);
-                    if writeln!(w, "raster {cw} {ch}").is_err() || w.write_all(&px).is_err() {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
+                // As a person would: scan the request, confirm it, then press for the camera.
+                if !self.silent && self.answer(&shown).is_some() {
+                    let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = writeln!(w, "press");
                 }
-            });
+            }
+            match l.scan {
+                Some(false) => on.store(false, Ordering::Relaxed),
+                Some(true) if !self.silent && !on.load(Ordering::Relaxed) => {
+                    let codes = if shown.is_empty() {
+                        Some(self.accounts_code())
+                    } else {
+                        self.answer(&shown)
+                    };
+                    let Some(codes) = codes else { continue };
+                    on.store(true, Ordering::Relaxed);
+                    let (w, on) = (writer.clone(), on.clone());
+                    std::thread::spawn(move || {
+                        while on.load(Ordering::Relaxed) {
+                            for text in &codes {
+                                let (cw, ch, px) = text_raster(text);
+                                let mut w = w.lock().unwrap_or_else(|e| e.into_inner());
+                                if writeln!(w, "raster {cw} {ch}").is_err()
+                                    || w.write_all(&px).is_err()
+                                {
+                                    return;
+                                }
+                                drop(w);
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
+                        }
+                    });
+                }
+                _ => {}
+            }
         }
-        let _ = writer.flush();
     }
 
     /// Listen for helpers in fake mode, one session per connection.
