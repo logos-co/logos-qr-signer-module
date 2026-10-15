@@ -206,6 +206,29 @@ fn a_cancelled_request_closes_the_session() {
 }
 
 #[test]
+fn accounts_are_named_and_unnamed() {
+    let (s, _) = signer(Emulator::default());
+    scan_all(&s);
+    let id = s.offered()[1].account.id.clone();
+    assert!(s.rename_account(&id, "  Savings ").unwrap());
+    assert_eq!(s.offered()[1].account.label.as_deref(), Some("Savings"));
+    assert!(
+        !s.rename_account(&id, "Savings").unwrap(),
+        "the same name changes nothing"
+    );
+    assert!(s.rename_account(&id, " ").unwrap());
+    assert_eq!(s.offered()[1].account.label, None);
+    assert_eq!(
+        s.rename_account(&id, &"x".repeat(81)).unwrap_err().code,
+        ErrorCode::Invalid
+    );
+    assert_eq!(
+        s.rename_account("nope", "x").unwrap_err().code,
+        ErrorCode::UnknownAccount
+    );
+}
+
+#[test]
 fn codes_shrink_to_fit_the_terminal_showing_them() {
     let (mut s, scanner) = signer_presented(Emulator::default(), Some(6));
     scan_all(&s);

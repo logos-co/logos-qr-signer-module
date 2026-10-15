@@ -360,6 +360,28 @@ impl QrSigner {
         }
         Ok(removed)
     }
+
+    /// Name an account for apps; a blank name clears it. Whether it changed.
+    pub fn rename_account(&self, id: &str, label: &str) -> Result<bool> {
+        let label = Some(label.trim()).filter(|l| !l.is_empty());
+        if label.as_ref().is_some_and(|l| l.chars().count() > 80) {
+            return Err(err(ErrorCode::Invalid, "a name is at most 80 characters"));
+        }
+        let (renamed, count) = {
+            let mut store = lock(&self.shared.store);
+            if store.find(id).is_none() {
+                return Err(err(ErrorCode::UnknownAccount, format!("no account {id}")));
+            }
+            let renamed = store
+                .rename(id, label.map(str::to_string))
+                .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+            (renamed, store.list().len())
+        };
+        if renamed {
+            self.shared.events.accounts_changed(count);
+        }
+        Ok(renamed)
+    }
 }
 
 impl Shared {

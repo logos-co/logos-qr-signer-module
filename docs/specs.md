@@ -56,6 +56,8 @@ For the app:
 | `scan_accounts` | `{ families, label?, profile? }` | `{ ok, job }`. Reads the wallet's account code and offers an account of each family it holds: `evm`, `bitcoin` (native segwit, BIP84) and `bitcoin_taproot` (BIP86) |
 | `add_status` | `job` | `{ ok, job, state, accounts, error? }`, `state` being `scanning`, `done` or `failed` |
 | `remove_account` | `id` | `{ ok, removed }`. Nothing on the wallet changes |
+| `rename_account` | `id, label` | `{ ok, renamed }`. The name apps see, up to 80 characters; blank clears it |
+| `wallets` | | `{ ok, wallets: [{ fingerprint, profile, label }] }`: each wallet accounts came from, by master fingerprint, and the profile it follows |
 
 Accounts are kept in `accounts.json` in the module's own directory: public material, the wallet's master
 fingerprint and the profile. Ids are as the Keycard Shell's USB module names them: the address for EVM,

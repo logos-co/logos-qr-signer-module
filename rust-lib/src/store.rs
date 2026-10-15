@@ -62,6 +62,19 @@ impl Store {
         self.save()
     }
 
+    /// Name an account, or clear its name with None. Whether it changed, saved.
+    pub fn rename(&mut self, id: &str, label: Option<String>) -> std::io::Result<bool> {
+        let Some(o) = self.offered.iter_mut().find(|o| same(&o.account, id)) else {
+            return Ok(false);
+        };
+        if o.account.label == label {
+            return Ok(false);
+        }
+        o.account.label = label;
+        self.save()?;
+        Ok(true)
+    }
+
     /// Whether an account went, saved.
     pub fn remove(&mut self, id: &str) -> std::io::Result<bool> {
         let before = self.offered.len();

@@ -35,6 +35,11 @@ pub trait QrSignerModule: Send + Sync + 'static {
     fn add_status(&self, job: String) -> String;
     /// Stop offering an account: `{ ok, removed }`. Nothing on the wallet changes.
     fn remove_account(&self, id: String) -> String;
+    /// Name an account for apps; a blank name clears it: `{ ok, renamed }`.
+    fn rename_account(&self, id: String, label: String) -> String;
+    /// The wallets accounts came from, by master fingerprint, with the profile each follows:
+    /// `{ ok, wallets: [{ fingerprint, profile, label }] }`.
+    fn wallets(&self) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
@@ -243,6 +248,30 @@ impl QrSignerModule for QrSignerModuleImpl {
             Ok(removed) => json!({ "ok": true, "removed": removed }).to_string(),
             Err(e) => signer_err(e),
         }
+    }
+
+    fn rename_account(&self, id: String, label: String) -> String {
+        match self.qr.rename_account(&id, &label) {
+            Ok(renamed) => json!({ "ok": true, "renamed": renamed }).to_string(),
+            Err(e) => signer_err(e),
+        }
+    }
+
+    fn wallets(&self) -> String {
+        let mut wallets: Vec<Value> = Vec::new();
+        for o in self.qr.offered() {
+            let fingerprint = hex::encode(o.fingerprint);
+            if wallets
+                .iter()
+                .any(|w| w["fingerprint"] == fingerprint.as_str())
+            {
+                continue;
+            }
+            let p = profile::get(&o.profile);
+            wallets
+                .push(json!({ "fingerprint": fingerprint, "profile": p.name, "label": p.label }));
+        }
+        json!({ "ok": true, "wallets": wallets }).to_string()
     }
 
     fn on_context_ready(&self, ctx: &RustModuleContext) {
