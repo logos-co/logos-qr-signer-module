@@ -55,6 +55,17 @@ pub struct ScanPoll {
     pub texts: Vec<String>,
     #[serde(default)]
     pub error: Option<ScanProblem>,
+    /// The largest code a terminal showing them has room for.
+    #[serde(default)]
+    pub presenter_max_version: Option<u8>,
+}
+
+/// A message to show as UR parts, sized by the wallet's profile.
+#[derive(Clone, Copy)]
+struct Request<'a> {
+    ur_type: &'a str,
+    cbor: &'a [u8],
+    profile: &'a Profile,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -356,15 +367,28 @@ impl Shared {
     fn session(
         &self,
         title: &str,
-        show: Option<Show<'_>>,
+        show: Option<Request<'_>>,
         hint: &str,
         expect: &[&'static str],
         job: Option<&str>,
     ) -> Result<Ended> {
-        let (session, token) = self
-            .scanner
-            .start(title, show, true, hint)
-            .map_err(|e| err(ErrorCode::Unavailable, e))?;
+        let mut version = show.map_or(0, |r| r.profile.max_version);
+        let mut parts = match show {
+            Some(r) => parts::parts(r.ur_type, r.cbor, r.profile.fragment)
+                .map_err(|e| err(ErrorCode::Internal, e))?,
+            None => Vec::new(),
+        };
+        let begin = |parts: &[String], version: u8| {
+            let show = show.map(|r| Show {
+                parts,
+                interval_ms: r.profile.interval_ms,
+                max_version: version,
+            });
+            self.scanner
+                .start(title, show, true, hint)
+                .map_err(|e| err(ErrorCode::Unavailable, e))
+        };
+        let (mut session, mut token) = begin(&parts, version)?;
         let started = Instant::now();
         let mut assembler = Assembler::expecting(expect);
         let mut shown = Progress {
@@ -400,6 +424,25 @@ impl Shared {
             }
             if let Some((t, cbor)) = assembler.done() {
                 break Ok(Ended::Answer(t, cbor));
+            }
+            // A terminal shows the codes and they don't fit it: smaller parts, in a new session.
+            if let (Some(r), Some(v)) = (show, poll.presenter_max_version) {
+                if v < version {
+                    version = v;
+                    if !parts::fit(&parts, v) {
+                        if let Some(smaller) =
+                            parts::parts_within(r.ur_type, r.cbor, r.profile.fragment, v)
+                        {
+                            self.scanner.stop(&session, &token);
+                            parts = smaller;
+                            match begin(&parts, v) {
+                                Ok(s) => (session, token) = s,
+                                Err(e) => break Err(e),
+                            }
+                            continue;
+                        }
+                    }
+                }
             }
             match poll.state.as_str() {
                 "cancelled" => {
@@ -462,12 +505,10 @@ impl Shared {
                 "eth-signature",
             ),
         };
-        let parts =
-            parts::parts(ur_type, &cbor, p.fragment).map_err(|e| err(ErrorCode::Internal, e))?;
-        let show = Show {
-            parts: &parts,
-            interval_ms: p.interval_ms,
-            max_version: p.max_version,
+        let show = Request {
+            ur_type,
+            cbor: &cbor,
+            profile: &p,
         };
         let hint = "Scan these codes with your wallet and confirm on it, then hold its answer up to the camera";
         let Ended::Answer(t, answer) = self.session(

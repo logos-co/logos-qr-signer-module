@@ -34,6 +34,10 @@ before anything is shown.
 The profile is the one `scan_accounts` names, else the one the code names (`crypto-multi-accounts` says
 which device), else `generic`.
 
+When a terminal shows the codes (`qr_scanner_module`'s presenter), its size can allow only smaller ones: the
+scanner's `poll` says the largest version that fits (`presenter_max_version`). If the parts don't fit it,
+the signer splits the request again into smaller parts, more of them, and restarts the session with them.
+
 ## Methods
 
 The signer interface's, as every signer implements them: `signer_info`, `signer_accounts`, `sign`,
