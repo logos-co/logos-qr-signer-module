@@ -437,6 +437,8 @@ impl Shared {
         patience: Duration,
     ) -> Result<Ended> {
         let mut version = show.map_or(0, |r| r.profile.max_version);
+        // The largest version last tried for a terminal, so each size is worked out once.
+        let mut tried: Option<u8> = None;
         let mut parts = match show {
             Some(r) => parts::parts(r.ur_type, r.cbor, r.profile.fragment)
                 .map_err(|e| err(ErrorCode::Internal, e))?,
@@ -485,22 +487,22 @@ impl Shared {
             if let Some((t, cbor)) = assembler.done() {
                 break Ok(Ended::Answer(t, cbor));
             }
-            // A terminal shows the codes and they don't fit it: smaller parts, in a new session.
+            // A terminal shows the codes and they don't fit it: smaller parts, in a new session. A
+            // terminal too small for any cycle is tried again once it is resized.
             if let (Some(r), Some(v)) = (show, poll.presenter_max_version) {
-                if v < version {
-                    version = v;
-                    if !parts::fit(&parts, v) {
-                        if let Some(smaller) =
-                            parts::parts_within(r.ur_type, r.cbor, r.profile.fragment, v)
-                        {
-                            self.scanner.stop(&session, &token);
-                            parts = smaller;
-                            match begin(&parts, v) {
-                                Ok(s) => (session, token) = s,
-                                Err(e) => break Err(e),
-                            }
-                            continue;
+                if v < version && tried != Some(v) && !parts::fit(&parts, v) {
+                    tried = Some(v);
+                    if let Some(smaller) =
+                        parts::parts_within(r.ur_type, r.cbor, r.profile.fragment, v)
+                    {
+                        self.scanner.stop(&session, &token);
+                        parts = smaller;
+                        version = v;
+                        match begin(&parts, v) {
+                            Ok(s) => (session, token) = s,
+                            Err(e) => break Err(e),
                         }
+                        continue;
                     }
                 }
             }

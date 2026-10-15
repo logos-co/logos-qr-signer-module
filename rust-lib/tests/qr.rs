@@ -18,8 +18,8 @@ struct InProcess {
     emu: Emulator,
     sessions: Mutex<HashMap<String, Vec<String>>>,
     stopped: Mutex<u32>,
-    /// A terminal presenting the codes, with room for codes up to this version.
-    presenter: Option<u8>,
+    /// A terminal presenting the codes, with room for codes up to this version; it can be resized.
+    presenter: Mutex<Option<u8>>,
     /// Each start's largest version allowed.
     shown: Mutex<Vec<u8>>,
     /// The wallet's account code is out of the camera's sight.
@@ -36,7 +36,13 @@ impl Scanner for InProcess {
     ) -> Result<(String, String), String> {
         let texts = match show {
             // Codes too large for the terminal never reach the wallet.
-            Some(s) if self.presenter.is_some_and(|v| !parts::fit(s.parts, v)) => {
+            Some(s)
+                if self
+                    .presenter
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|v| !parts::fit(s.parts, v)) =>
+            {
                 self.shown.lock().unwrap().push(s.max_version);
                 Vec::new()
             }
@@ -68,7 +74,7 @@ impl Scanner for InProcess {
             state: "running".into(),
             texts,
             error: None,
-            presenter_max_version: self.presenter,
+            presenter_max_version: *self.presenter.lock().unwrap(),
         })
     }
 
@@ -96,7 +102,7 @@ fn signer_presented(emu: Emulator, presenter: Option<u8>) -> (QrSigner, Arc<InPr
         emu,
         sessions: Mutex::new(HashMap::new()),
         stopped: Mutex::new(0),
-        presenter,
+        presenter: Mutex::new(presenter),
         shown: Mutex::new(Vec::new()),
         hidden: AtomicBool::new(false),
     });
@@ -276,6 +282,26 @@ fn accounts_are_named_and_unnamed() {
 fn codes_shrink_to_fit_the_terminal_showing_them() {
     let (mut s, scanner) = signer_presented(Emulator::default(), Some(6));
     scan_all(&s);
+    let job = sign_a_psbt(&mut s);
+    assert_eq!(wait(&mut s, &job), JobState::Done);
+    // The profile's codes first, then, once the terminal said how much room it has, ones that fit.
+    assert_eq!(*scanner.shown.lock().unwrap(), vec![25, 6]);
+}
+
+#[test]
+fn a_terminal_too_small_for_any_code_is_tried_again_once_resized() {
+    // Room for version 1 only, which no part cycle fits in, as a 120 by 30 console.
+    let (mut s, scanner) = signer_presented(Emulator::default(), Some(1));
+    scan_all(&s);
+    let job = sign_a_psbt(&mut s);
+    std::thread::sleep(Duration::from_millis(600));
+    *scanner.presenter.lock().unwrap() = Some(6);
+    assert_eq!(wait(&mut s, &job), JobState::Done);
+    assert_eq!(*scanner.shown.lock().unwrap(), vec![25, 6]);
+}
+
+/// A PSBT spending two coins of the first Bitcoin account, asked for.
+fn sign_a_psbt(s: &mut QrSigner) -> String {
     let account = s
         .offered()
         .into_iter()
@@ -288,19 +314,15 @@ fn codes_shrink_to_fit_the_terminal_showing_them() {
         .map(|t| (format!("{base}/{t}"), format!("{base}/{t}")))
         .collect();
     let (psbt, _) = conformance::psbt_for(&account, &inputs);
-    let job = s
-        .sign(SignRequest {
-            account: account.id.clone(),
-            payload: Payload::BtcPsbt {
-                network: "testnet".into(),
-                psbt,
-            },
-            secret: None,
-        })
-        .unwrap();
-    assert_eq!(wait(&mut s, &job), JobState::Done);
-    // The profile's codes first, then, once the terminal said how much room it has, ones that fit.
-    assert_eq!(*scanner.shown.lock().unwrap(), vec![25, 6]);
+    s.sign(SignRequest {
+        account: account.id.clone(),
+        payload: Payload::BtcPsbt {
+            network: "testnet".into(),
+            psbt,
+        },
+        secret: None,
+    })
+    .unwrap()
 }
 
 #[test]
