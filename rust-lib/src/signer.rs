@@ -423,6 +423,61 @@ impl QrSigner {
         }
         Ok(renamed)
     }
+
+    /// Name a wallet by its master fingerprint, for apps; a blank name clears it. Whether it changed.
+    pub fn rename_wallet(&self, fingerprint: &str, name: &str) -> Result<bool> {
+        let fingerprint = fingerprint.trim().to_ascii_lowercase();
+        let name = Some(name.trim()).filter(|n| !n.is_empty());
+        if name.as_ref().is_some_and(|n| n.chars().count() > 80) {
+            return Err(err(ErrorCode::Invalid, "a name is at most 80 characters"));
+        }
+        let (renamed, count) = {
+            let mut store = lock(&self.shared.store);
+            if !store
+                .list()
+                .iter()
+                .any(|o| hex::encode(o.fingerprint) == fingerprint)
+            {
+                return Err(err(ErrorCode::Invalid, format!("no wallet {fingerprint}")));
+            }
+            let renamed = store
+                .rename_wallet(&fingerprint, name.map(str::to_string))
+                .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+            (renamed, store.list().len())
+        };
+        if renamed {
+            self.shared.events.accounts_changed(count);
+        }
+        Ok(renamed)
+    }
+
+    /// The name given to a wallet, by master fingerprint in hex.
+    pub fn wallet_name(&self, fingerprint: &str) -> Option<String> {
+        lock(&self.shared.store)
+            .wallet_name(fingerprint)
+            .map(str::to_string)
+    }
+
+    /// Each account's `origin`, by id: the wallet it shows on, and the wallet it comes from.
+    pub fn account_origins(&self) -> HashMap<String, serde_json::Value> {
+        let store = lock(&self.shared.store);
+        store
+            .list()
+            .iter()
+            .map(|o| {
+                let fp = hex::encode(o.fingerprint);
+                let device = serde_json::json!({
+                    "id": format!("qr-{fp}"), "kind": "qr", "name": profile::get(&o.profile).label
+                });
+                let phrase =
+                    serde_json::json!({ "id": format!("fp:{fp}"), "name": store.wallet_name(&fp) });
+                let origin = serde_json::json!({
+                    "devices": [device], "phrase": phrase, "kind": "derived", "path": o.account.path
+                });
+                (o.account.id.clone(), origin)
+            })
+            .collect()
+    }
 }
 
 impl Shared {
