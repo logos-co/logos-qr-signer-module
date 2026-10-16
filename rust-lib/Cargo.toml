@@ -1,0 +1,57 @@
+[package]
+name = "qr_signer_module"
+version = "0.1.0"
+edition = "2021"
+description = "Logos signer module for air-gapped wallets that sign over QR codes (BC-UR, ERC-4527): the Keycard Shell, Keystone, Passport, Jade and others."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/logos-co/logos-qr-signer-module"
+# The module builder's rustc; resolver 3 keeps the lock within it.
+rust-version = "1.89"
+
+[workspace]
+resolver = "3"
+
+[lib]
+# staticlib for the Qt plugin; rlib so cargo test builds the core without the Logos runtime.
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "qr-device-emulator"
+path = "src/bin/emulator.rs"
+required-features = ["emulator"]
+
+[[bin]]
+name = "qr-psbt-for"
+path = "src/bin/psbt_for.rs"
+required-features = ["emulator"]
+
+[dependencies]
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "ca703f1ab6a3fe4149f554ecb9f54e8d15b19510", features = ["psbt"] }
+# PSBTs, BIP32 keys and secp256k1. The plugin's export list keeps libsecp256k1 in.
+bitcoin = { version = "0.32.102", default-features = false, features = ["std", "base64"] }
+# Bytewords and the fountain codes of BC-UR; our own CBOR, in the CDDL's key order.
+ur = "0.5.2"
+minicbor = { version = "2", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha3 = "0.10"
+getrandom = "0.3"
+
+# The emulator's own: a QR device in software, behind the QR helper's fake mode.
+rqrr = { version = "0.11", default-features = false, optional = true }
+qrcodegen = { version = "1.8", optional = true }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
+sha2 = { version = "0.10", optional = true }
+
+# Staged by the builder as a sibling crate; optional so cargo test builds the core without it.
+logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+[dev-dependencies]
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "ca703f1ab6a3fe4149f554ecb9f54e8d15b19510", features = ["psbt", "mock", "conformance"] }
+
+[features]
+default = ["logos_module"]
+logos_module = ["dep:logos-rust-sdk"]
+# A QR wallet in software, for tests and doctests; never in the module.
+emulator = ["dep:rqrr", "dep:qrcodegen", "dep:pbkdf2", "dep:sha2", "logos-signer-interface/mock", "logos-signer-interface/conformance"]

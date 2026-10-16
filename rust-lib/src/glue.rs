@@ -1,0 +1,303 @@
+//! Logos module glue for `qr_signer_module`. The builder derives the `.lidl` from the
+//! `QrSignerModule` trait and injects the generated scaffold at the `include!` point.
+//!
+//! Every reply is a JSON string: `{ "ok": true, ... }` or `{ "ok": false, "error": "...", "code"? }`.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use logos_signer_interface::json as signer_json;
+use logos_signer_interface::JobState;
+use serde_json::{json, Value};
+
+use crate::profile;
+use crate::signer::{Events, QrSigner, ScanPoll, ScanRequest, Scanner, Show};
+use crate::store::Store;
+
+pub trait QrSignerModule: Send + Sync + 'static {
+    // ── logos.signer/1 ──────────────────────────────────────────────────
+    fn signer_info(&self) -> String;
+    fn signer_accounts(&self) -> String;
+    fn sign(&self, request_json: String) -> String;
+    fn sign_status(&self, job: String) -> String;
+    fn sign_result(&self, job: String) -> String;
+    fn cancel_sign(&self, job: String) -> String;
+
+    // ── the QR signer's app ─────────────────────────────────────────────
+    /// The wallets it knows by name: `{ ok, profiles: [{ name, label }] }`.
+    fn profiles(&self) -> String;
+    /// Read a wallet's account code and offer accounts of these families:
+    /// `{ families, label?, profile? }` → `{ ok, job }`.
+    fn scan_accounts(&self, params_json: String) -> String;
+    /// A scan's progress: `{ ok, job, state, accounts, error? }`.
+    fn add_status(&self, job: String) -> String;
+    /// Stop a scan: `{ ok, cancelled }`, whether it was still running.
+    fn cancel_scan(&self, job: String) -> String;
+    /// Stop offering an account: `{ ok, removed }`. Nothing on the wallet changes.
+    fn remove_account(&self, id: String) -> String;
+    /// Name an account for apps; a blank name clears it: `{ ok, renamed }`.
+    fn rename_account(&self, id: String, label: String) -> String;
+    /// The wallets accounts came from, by master fingerprint, with the profile each follows:
+    /// `{ ok, wallets: [{ fingerprint, profile, label }] }`.
+    fn wallets(&self) -> String;
+
+    fn on_context_ready(&self, _ctx: &RustModuleContext) {}
+}
+
+pub trait QrSignerModuleEvents {
+    fn signer_accounts_changed(&self, count: i64);
+    fn sign_progress(&self, job: String, state: String);
+}
+
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/generated/provider_gen.rs"
+));
+
+static UNLOADING: AtomicBool = AtomicBool::new(false);
+
+/// How long one call to the scanner may take; a session itself lasts as long as the person needs.
+const BUDGET: Duration = Duration::from_secs(20);
+
+struct Emit;
+
+impl Events for Emit {
+    fn sign_progress(&self, job: &str, state: JobState) {
+        if !UNLOADING.load(Ordering::SeqCst) {
+            emit_sign_progress(job, state.as_str());
+        }
+    }
+    fn accounts_changed(&self, count: usize) {
+        if !UNLOADING.load(Ordering::SeqCst) {
+            emit_signer_accounts_changed(count as i64);
+        }
+    }
+}
+
+fn wait<T>(rx: Receiver<Result<T, logos_rust_sdk::LogosError>>) -> Result<T, String> {
+    let start = Instant::now();
+    loop {
+        if UNLOADING.load(Ordering::SeqCst) {
+            return Err("unloading".into());
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(r) => return r.map_err(|e| e.to_string()),
+            Err(RecvTimeoutError::Timeout) if start.elapsed() < BUDGET + Duration::from_secs(5) => {
+                continue
+            }
+            Err(_) => return Err("the QR scanner didn't answer".into()),
+        }
+    }
+}
+
+/// The scanner module, called from job threads without blocking its main thread: one client,
+/// asynchronous calls, each answer waited for on a channel.
+#[derive(Default)]
+struct ScannerIpc(OnceLock<qr_scanner_module::QrScannerModuleClient>);
+
+impl ScannerIpc {
+    fn c(&self) -> &qr_scanner_module::QrScannerModuleClient {
+        self.0
+            .get_or_init(qr_scanner_module::QrScannerModuleClient::new)
+    }
+}
+
+macro_rules! ipc {
+    ($self:ident, $method:ident, $($arg:expr),*) => {{
+        let (tx, rx) = sync_channel(1);
+        $self.c().$method($($arg,)* BUDGET, move |r| {
+            let _ = tx.send(r);
+        });
+        wait(rx)
+    }};
+}
+
+/// A reply's fields when `ok`, its error otherwise.
+fn reply(raw: String) -> Result<Value, String> {
+    let v: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("the QR scanner's reply: {e}"))?;
+    if v["ok"] == true {
+        Ok(v)
+    } else {
+        Err(v["error"]
+            .as_str()
+            .unwrap_or("the QR scanner refused")
+            .to_string())
+    }
+}
+
+impl Scanner for ScannerIpc {
+    fn start(
+        &self,
+        title: &str,
+        show: Option<Show<'_>>,
+        scan: bool,
+        hint: &str,
+    ) -> Result<(String, String), String> {
+        let mut p = json!({ "title": title, "scan": scan, "hint": hint });
+        if let Some(s) = show {
+            p["show"] = json!({ "parts": s.parts, "interval_ms": s.interval_ms, "max_version": s.max_version });
+        }
+        let v = reply(ipc!(self, start_async_with_timeout, &p.to_string())?)?;
+        match (v["session"].as_str(), v["token"].as_str()) {
+            (Some(s), Some(t)) => Ok((s.to_string(), t.to_string())),
+            _ => Err("the QR scanner gave no session".into()),
+        }
+    }
+
+    fn poll(&self, session: &str, token: &str) -> Result<ScanPoll, String> {
+        let v = reply(ipc!(self, poll_async_with_timeout, session, token)?)?;
+        serde_json::from_value(v).map_err(|e| format!("the QR scanner's poll: {e}"))
+    }
+
+    fn progress(&self, session: &str, token: &str, received: usize, expected: usize) {
+        let p = json!({ "received": received, "expected": expected }).to_string();
+        let _ = ipc!(self, progress_async_with_timeout, session, token, &p);
+    }
+
+    fn stop(&self, session: &str, token: &str) {
+        let _ = ipc!(self, stop_async_with_timeout, session, token);
+    }
+}
+
+struct QrSignerModuleImpl {
+    qr: QrSigner,
+}
+
+impl Default for QrSignerModuleImpl {
+    fn default() -> Self {
+        QrSignerModuleImpl {
+            qr: QrSigner::new(
+                Arc::new(ScannerIpc::default()),
+                Store::new(),
+                Box::new(Emit),
+            ),
+        }
+    }
+}
+
+fn err(e: impl std::fmt::Display) -> String {
+    json!({ "ok": false, "error": e.to_string() }).to_string()
+}
+
+fn signer_err(e: logos_signer_interface::SignerError) -> String {
+    json!({ "ok": false, "code": e.code, "error": e.message }).to_string()
+}
+
+impl QrSignerModule for QrSignerModuleImpl {
+    fn signer_info(&self) -> String {
+        signer_json::signer_info(&self.qr)
+    }
+
+    fn signer_accounts(&self) -> String {
+        signer_json::signer_accounts(&mut self.qr.clone())
+    }
+
+    fn sign(&self, request_json: String) -> String {
+        signer_json::sign(&mut self.qr.clone(), &request_json)
+    }
+
+    fn sign_status(&self, job: String) -> String {
+        signer_json::sign_status(&mut self.qr.clone(), &job)
+    }
+
+    fn sign_result(&self, job: String) -> String {
+        signer_json::sign_result(&mut self.qr.clone(), &job)
+    }
+
+    fn cancel_sign(&self, job: String) -> String {
+        signer_json::cancel_sign(&mut self.qr.clone(), &job)
+    }
+
+    fn profiles(&self) -> String {
+        let profiles: Vec<Value> = profile::ALL
+            .iter()
+            .map(|p| json!({ "name": p.name, "label": p.label }))
+            .collect();
+        json!({ "ok": true, "profiles": profiles }).to_string()
+    }
+
+    fn scan_accounts(&self, params_json: String) -> String {
+        let req: ScanRequest = match serde_json::from_str(&params_json) {
+            Ok(r) => r,
+            Err(e) => return err(format!("params: {e}")),
+        };
+        match self.qr.scan_accounts(req) {
+            Ok(job) => json!({ "ok": true, "job": job }).to_string(),
+            Err(e) => signer_err(e),
+        }
+    }
+
+    fn add_status(&self, job: String) -> String {
+        match self.qr.add_status(&job) {
+            Some(added) => {
+                let mut v = json!({ "ok": true, "job": job });
+                if let (Some(out), Ok(Value::Object(fields))) =
+                    (v.as_object_mut(), serde_json::to_value(added))
+                {
+                    out.extend(fields);
+                }
+                v.to_string()
+            }
+            None => err(format!("no scan {job}")),
+        }
+    }
+
+    fn cancel_scan(&self, job: String) -> String {
+        json!({ "ok": true, "cancelled": self.qr.cancel_scan(&job) }).to_string()
+    }
+
+    fn remove_account(&self, id: String) -> String {
+        match self.qr.remove_account(&id) {
+            Ok(removed) => json!({ "ok": true, "removed": removed }).to_string(),
+            Err(e) => signer_err(e),
+        }
+    }
+
+    fn rename_account(&self, id: String, label: String) -> String {
+        match self.qr.rename_account(&id, &label) {
+            Ok(renamed) => json!({ "ok": true, "renamed": renamed }).to_string(),
+            Err(e) => signer_err(e),
+        }
+    }
+
+    fn wallets(&self) -> String {
+        let mut wallets: Vec<Value> = Vec::new();
+        for o in self.qr.offered() {
+            let fingerprint = hex::encode(o.fingerprint);
+            if wallets
+                .iter()
+                .any(|w| w["fingerprint"] == fingerprint.as_str())
+            {
+                continue;
+            }
+            let p = profile::get(&o.profile);
+            wallets
+                .push(json!({ "fingerprint": fingerprint, "profile": p.name, "label": p.label }));
+        }
+        json!({ "ok": true, "wallets": wallets }).to_string()
+    }
+
+    fn on_context_ready(&self, ctx: &RustModuleContext) {
+        // The accounts offered live in the module's own directory.
+        match Store::open(&ctx.instance_persistence_path) {
+            Ok(store) => self.qr.set_store(store),
+            Err(e) => eprintln!("qr_signer_module: {}: {e}", ctx.instance_persistence_path),
+        }
+    }
+}
+
+impl logos_rust_sdk::AboutToUnload for QrSignerModuleImpl {
+    /// Calls waiting on the scanner are answered first: their replies would need this thread.
+    fn about_to_unload(&self) -> logos_rust_sdk::Shutdown {
+        UNLOADING.store(true, Ordering::SeqCst);
+        logos_rust_sdk::Shutdown::Synchronous
+    }
+}
+
+#[no_mangle]
+pub extern "Rust" fn logos_module_install() {
+    logos_install!(QrSignerModuleImpl);
+}
