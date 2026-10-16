@@ -44,7 +44,7 @@ sections:
         run: |
           nix build 'github:logos-co/logos-qr-signer-module{release}#lgx' --no-write-lock-file -o signer-lgx
           nix build 'github:logos-co/logos-qr-signer-module{release}#emulator' --no-write-lock-file -o emulator
-          nix build 'github:logos-co/logos-qr-scanner-module/9984cd5de4d9a0631f2b057f5c8fe1df781cc92c#lgx' --no-write-lock-file -o scanner-lgx
+          nix build 'github:logos-co/logos-qr-scanner-module/bd5084b7491e3914538099b43d18e7e5e832c771#lgx' --no-write-lock-file -o scanner-lgx
           nix build 'github:logos-co/logos-evm-keystore-module/c68b7b4d933f30f87e033e6a1d7865f298e4d858#lgx' --no-write-lock-file -o keystore-lgx
           nix build 'github:logos-co/logos-signer-manager-module/80bc40ccbe6c689caadc736b3db2136bfbde1818#lgx' --no-write-lock-file -o manager-lgx
           nix build 'github:logos-co/logos-signer-manager-module/80bc40ccbe6c689caadc736b3db2136bfbde1818?dir=doctests/manager-probe#lgx' --override-input signer_manager_module 'github:logos-co/logos-signer-manager-module/80bc40ccbe6c689caadc736b3db2136bfbde1818' --override-input keystore_module 'github:logos-co/logos-evm-keystore-module/c68b7b4d933f30f87e033e6a1d7865f298e4d858' --no-write-lock-file -o probe-lgx
