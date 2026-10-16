@@ -61,10 +61,13 @@ For the app:
 | `cancel_scan` | `job` | `{ ok, cancelled }`, whether the scan was still running |
 | `remove_account` | `id` | `{ ok, removed }`. Nothing on the wallet changes |
 | `rename_account` | `id, label` | `{ ok, renamed }`. The name apps see, up to 80 characters; blank clears it |
-| `wallets` | | `{ ok, wallets: [{ fingerprint, profile, label }] }`: each wallet accounts came from, by master fingerprint, and the profile it follows |
+| `wallets` | | `{ ok, wallets: [{ fingerprint, profile, label, name }] }`: each wallet accounts came from, by master fingerprint, the profile it follows and the name given to it |
+| `rename_wallet` | `fingerprint, name` | `{ ok, renamed }`. Names a wallet some account came from, up to 80 characters; blank clears it. The name goes with the wallet's last account |
 
 Accounts are kept in `accounts.json` in the module's own directory: public material, the wallet's master
-fingerprint and the profile. Ids are as the Keycard Shell's USB module names them: the address for EVM,
+fingerprint and the profile, and the wallets' names. Each `signer_accounts` row carries the signer
+interface's `origin`: the wallet as the device (`kind: "qr"`, named by its profile), and `phrase` as
+`{ id: "fp:<fingerprint>", name }`. Ids are as the Keycard Shell's USB module names them: the address for EVM,
 `qr-<fingerprint>-<purpose>-<coin>-<account>` for Bitcoin. When the same account is offered by two signers,
 the manager gives it to the one it consults first.
 

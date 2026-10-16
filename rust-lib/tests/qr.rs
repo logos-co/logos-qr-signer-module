@@ -279,6 +279,58 @@ fn accounts_are_named_and_unnamed() {
 }
 
 #[test]
+fn a_wallet_is_named_and_its_accounts_say_where_they_come_from() {
+    let (s, _) = signer(Emulator::default());
+    scan_all(&s);
+    let fp = hex::encode(s.offered()[0].fingerprint);
+    let first = s.offered()[0].account.id.clone();
+    let origin = &s.account_origins()[&first];
+    assert_eq!(
+        origin["phrase"],
+        serde_json::json!({ "id": format!("fp:{fp}"), "name": null })
+    );
+    assert_eq!(origin["devices"][0]["kind"], "qr");
+    assert!(s.rename_wallet(&fp.to_uppercase(), " Cold ").unwrap());
+    assert!(
+        !s.rename_wallet(&fp, "Cold").unwrap(),
+        "the same name changes nothing"
+    );
+    for o in s.offered() {
+        assert_eq!(s.account_origins()[&o.account.id]["phrase"]["name"], "Cold");
+    }
+    assert_eq!(
+        s.rename_wallet("00000000", "x").unwrap_err().code,
+        ErrorCode::Invalid
+    );
+    assert_eq!(
+        s.rename_wallet(&fp, &"x".repeat(81)).unwrap_err().code,
+        ErrorCode::Invalid
+    );
+    for o in s.offered() {
+        s.remove_account(&o.account.id).unwrap();
+    }
+    assert_eq!(
+        s.wallet_name(&fp),
+        None,
+        "the name goes with the wallet's last account"
+    );
+}
+
+#[test]
+fn a_wallet_name_is_kept_with_the_accounts() {
+    let dir = std::env::temp_dir().join(format!("qr-store-{}", std::process::id()));
+    let (s, _) = signer(Emulator::default());
+    s.set_store(Store::open(&dir).unwrap());
+    scan_all(&s);
+    let fp = hex::encode(s.offered()[0].fingerprint);
+    s.rename_wallet(&fp, "Cold").unwrap();
+    let reopened = Store::open(&dir).unwrap();
+    assert_eq!(reopened.wallet_name(&fp), Some("Cold"));
+    assert_eq!(reopened.list().len(), 3);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn codes_shrink_to_fit_the_terminal_showing_them() {
     let (mut s, scanner) = signer_presented(Emulator::default(), Some(6));
     scan_all(&s);

@@ -39,9 +39,11 @@ pub trait QrSignerModule: Send + Sync + 'static {
     fn remove_account(&self, id: String) -> String;
     /// Name an account for apps; a blank name clears it: `{ ok, renamed }`.
     fn rename_account(&self, id: String, label: String) -> String;
-    /// The wallets accounts came from, by master fingerprint, with the profile each follows:
-    /// `{ ok, wallets: [{ fingerprint, profile, label }] }`.
+    /// The wallets accounts came from, by master fingerprint, with the profile each follows and
+    /// the name given to it: `{ ok, wallets: [{ fingerprint, profile, label, name }] }`.
     fn wallets(&self) -> String;
+    /// Name a wallet by its master fingerprint; a blank name clears it: `{ ok, renamed }`.
+    fn rename_wallet(&self, fingerprint: String, name: String) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
@@ -192,7 +194,19 @@ impl QrSignerModule for QrSignerModuleImpl {
     }
 
     fn signer_accounts(&self) -> String {
-        signer_json::signer_accounts(&mut self.qr.clone())
+        let raw = signer_json::signer_accounts(&mut self.qr.clone());
+        let Ok(mut reply) = serde_json::from_str::<Value>(&raw) else {
+            return raw;
+        };
+        let origins = self.qr.account_origins();
+        if let Some(rows) = reply["accounts"].as_array_mut() {
+            for row in rows {
+                if let Some(origin) = row["id"].as_str().and_then(|id| origins.get(id)) {
+                    row["origin"] = origin.clone();
+                }
+            }
+        }
+        reply.to_string()
     }
 
     fn sign(&self, request_json: String) -> String {
@@ -274,10 +288,19 @@ impl QrSignerModule for QrSignerModuleImpl {
                 continue;
             }
             let p = profile::get(&o.profile);
-            wallets
-                .push(json!({ "fingerprint": fingerprint, "profile": p.name, "label": p.label }));
+            let name = self.qr.wallet_name(&fingerprint);
+            wallets.push(json!({
+                "fingerprint": fingerprint, "profile": p.name, "label": p.label, "name": name
+            }));
         }
         json!({ "ok": true, "wallets": wallets }).to_string()
+    }
+
+    fn rename_wallet(&self, fingerprint: String, name: String) -> String {
+        match self.qr.rename_wallet(&fingerprint, &name) {
+            Ok(renamed) => json!({ "ok": true, "renamed": renamed }).to_string(),
+            Err(e) => signer_err(e),
+        }
     }
 
     fn on_context_ready(&self, ctx: &RustModuleContext) {

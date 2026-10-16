@@ -1,6 +1,7 @@
-//! The accounts offered, kept in the module's own directory as `accounts.json`: public material
-//! only.
+//! The accounts offered, kept in the module's own directory as `accounts.json` with the names
+//! given to the wallets they came from: public material only.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use logos_signer_interface::Account;
@@ -11,12 +12,16 @@ use crate::accounts::Offered;
 #[derive(Default, Serialize, Deserialize)]
 struct File {
     accounts: Vec<Offered>,
+    /// Wallet names, by master fingerprint in hex.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    wallets: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
 pub struct Store {
     path: Option<PathBuf>,
     offered: Vec<Offered>,
+    wallets: BTreeMap<String, String>,
 }
 
 impl Store {
@@ -28,14 +33,15 @@ impl Store {
     /// Read `dir/accounts.json`, kept there from now on. A missing file is an empty list.
     pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = dir.into().join("accounts.json");
-        let offered = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<File>(&bytes)?.accounts,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        let file = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice::<File>(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => File::default(),
             Err(e) => return Err(e),
         };
         Ok(Store {
             path: Some(path),
-            offered,
+            offered: file.accounts,
+            wallets: file.wallets,
         })
     }
 
@@ -75,12 +81,37 @@ impl Store {
         Ok(true)
     }
 
-    /// Whether an account went, saved.
+    /// Whether an account went, saved. A wallet's name goes with its last account.
     pub fn remove(&mut self, id: &str) -> std::io::Result<bool> {
         let before = self.offered.len();
         self.offered.retain(|o| !same(&o.account, id));
+        let offered = &self.offered;
+        self.wallets
+            .retain(|fp, _| offered.iter().any(|o| hex::encode(o.fingerprint) == *fp));
         self.save()?;
         Ok(self.offered.len() != before)
+    }
+
+    /// The name given to the wallet with this master fingerprint, in hex.
+    pub fn wallet_name(&self, fingerprint: &str) -> Option<&str> {
+        self.wallets.get(fingerprint).map(String::as_str)
+    }
+
+    /// Name a wallet, or clear its name with None. Whether it changed, saved.
+    pub fn rename_wallet(
+        &mut self,
+        fingerprint: &str,
+        name: Option<String>,
+    ) -> std::io::Result<bool> {
+        if self.wallets.get(fingerprint) == name.as_ref() {
+            return Ok(false);
+        }
+        match name {
+            Some(name) => self.wallets.insert(fingerprint.to_string(), name),
+            None => self.wallets.remove(fingerprint),
+        };
+        self.save()?;
+        Ok(true)
     }
 
     fn save(&self) -> std::io::Result<()> {
@@ -92,6 +123,7 @@ impl Store {
         }
         let body = serde_json::to_vec_pretty(&File {
             accounts: self.offered.clone(),
+            wallets: self.wallets.clone(),
         })?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, body)?;
