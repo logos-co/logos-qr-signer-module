@@ -12,8 +12,9 @@ use bitcoin::bip32::{DerivationPath, Fingerprint};
 use bitcoin::Psbt;
 use logos_signer_interface::conformance::{self, Fixture};
 use logos_signer_interface::mock::MockSigner;
+use logos_signer_interface::wallets::DataKey;
 use logos_signer_interface::{unlock, Account, ErrorCode, Family, JobState, Payload, SignRequest};
-use logos_signer_interface::{Signer, SignerError, UnlockKey, UnlockKeyRequest};
+use logos_signer_interface::{Secret, Signer, SignerError, UnlockKey, UnlockKeyRequest};
 use qr_signer_module::emulator::Emulator;
 use qr_signer_module::parts;
 use qr_signer_module::signer::{Events, QrSigner, ScanPoll, ScanRequest, Scanner, Show};
@@ -546,30 +547,6 @@ fn the_origin_names_the_device_model() {
     assert_eq!(device["profile"], "generic");
 }
 
-#[cfg(unix)]
-#[test]
-fn accounts_json_is_its_owners_alone() {
-    use std::os::unix::fs::PermissionsExt;
-    let d = dir("mode");
-    std::fs::create_dir_all(&d).unwrap();
-    // A file from before keeps nothing of its old mode.
-    std::fs::write(d.join("accounts.json"), "{\"accounts\":[]}").unwrap();
-    std::fs::set_permissions(
-        d.join("accounts.json"),
-        std::fs::Permissions::from_mode(0o644),
-    )
-    .unwrap();
-    let (s, _) = signer(Emulator::default());
-    s.set_store(Store::open(&d).unwrap());
-    scan_all(&s);
-    let mode = std::fs::metadata(d.join("accounts.json"))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600);
-    std::fs::remove_dir_all(&d).unwrap();
-}
-
 #[test]
 fn a_cancelled_request_closes_the_session() {
     let (mut s, scanner) = signer(Emulator::default());
@@ -692,23 +669,86 @@ fn a_wallet_is_named_and_its_accounts_say_where_they_come_from() {
     );
 }
 
+/// A module's key for a seed's data, as the signer manager gives it.
+fn data_key(byte: u8, generation: u32) -> DataKey {
+    DataKey {
+        key: Secret::new(hex::encode([byte; 32])),
+        generation,
+    }
+}
+
 #[test]
-fn a_wallet_name_is_kept_with_the_accounts_and_registered() {
-    let d = dir("store");
+fn a_seeds_accounts_are_sealed_under_its_key_and_read_only_while_unlocked() {
+    let d = dir("sealed");
+    let path = d.join("accounts.sealed.json");
     let r = rig(
         Emulator::default(),
         Store::open(&d).unwrap(),
         Duration::from_secs(20),
     );
     scan_all(&r.signer);
-    let fp = hex::encode(r.signer.offered()[0].fingerprint);
-    r.signer.rename_wallet(&fp, "Cold").unwrap();
-    let reopened = Store::open(&d).unwrap();
-    assert_eq!(reopened.wallet_name(&fp), Some("Cold"));
-    assert_eq!(reopened.list().len(), 3);
-    // Added again, the seed is registered under the name it was given.
-    scan_all(&r.signer);
-    assert_eq!(r.heard.0.lock().unwrap().last().unwrap().2, "Cold");
+    let seed = seed_of(&r.signer);
+    assert!(
+        !path.exists(),
+        "nothing written before the seed's key comes"
+    );
+    assert_eq!(r.signer.closed_seeds(), vec![(seed.clone(), None)]);
+    r.signer
+        .open_seed(&seed, &data_key(1, 0), &data_key(1, 0))
+        .unwrap();
+    r.signer.rename_wallet(&seed, "Cold").unwrap();
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(body.contains(&seed), "{body}");
+    for plain in ["tpub", "xpub", "0xf39f", "Cold", "Keycard"] {
+        assert!(!body.contains(plain), "{plain} in {body}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    r.signer.lock_seeds();
+    assert!(
+        r.signer.offered().is_empty(),
+        "nothing offered while locked"
+    );
+
+    // After a restart: locked until the manager gives the key, and only its key opens it.
+    let mut again = rig(
+        Emulator::default(),
+        Store::open(&d).unwrap(),
+        Duration::from_secs(20),
+    );
+    assert!(again.signer.accounts().unwrap().is_empty());
+    assert_eq!(again.signer.closed_seeds(), vec![(seed.clone(), Some(0))]);
+    assert!(again
+        .signer
+        .open_seed(&seed, &data_key(2, 0), &data_key(2, 0))
+        .is_err());
+    // An add before the key comes waits for it, and joins the wallet when it opens.
+    again.scanner.hidden.store(false, Ordering::SeqCst);
+    scan_all(&again.signer);
+    assert!(again.signer.offered().is_empty(), "it waits for the key");
+    again
+        .signer
+        .open_seed(&seed, &data_key(1, 0), &data_key(1, 1))
+        .unwrap();
+    assert_eq!(again.signer.accounts().unwrap().len(), 3);
+    assert_eq!(again.signer.wallet_name(&seed).as_deref(), Some("Cold"));
+    // Added while locked, its name was sealed: the seed is registered under its device's.
+    assert_eq!(
+        again.heard.0.lock().unwrap().last().unwrap().2,
+        "Keycard Shell (emulated)"
+    );
+    scan_all(&again.signer);
+    assert_eq!(again.heard.0.lock().unwrap().last().unwrap().2, "Cold");
+    let third = Store::open(&d).unwrap();
+    assert_eq!(
+        third.closed(),
+        vec![(seed, Some(1))],
+        "sealed again under the current generation"
+    );
     std::fs::remove_dir_all(&d).unwrap();
 }
 

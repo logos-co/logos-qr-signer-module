@@ -71,7 +71,7 @@ Shell's card refuses them.
 - A Bitcoin request may bring its wallet's `xpub`; one that isn't the account's is refused (`invalid`).
 - Nothing signs under the reserved purpose `m/1280263247'`: an account whose path sits there, or a PSBT
   naming a key there in any input, output or global xpub, is refused before anything is shown.
-- An EVM account's path must sit under `m/44'/60'`, as an edited `accounts.json` could put it elsewhere.
+- An EVM account's path must sit under `m/44'/60'`, whatever a stored row says.
 - `qr_scanner_module` shows an `eth-sign-request` under the reserved purpose only for this module.
 
 ## Methods
@@ -102,9 +102,24 @@ For the app:
 | `wallets` | | `{ ok, wallets: [{ fingerprint, profile, label, name }] }`: each wallet accounts came from, by master fingerprint, the profile it follows and the name given to it |
 | `rename_wallet` | `fingerprint, name` | `{ ok, renamed }`. Names a wallet some account came from, up to 80 characters; blank clears it. The name goes with the wallet's last account |
 
-Accounts are kept in `accounts.json` in the module's own directory, readable by its owner alone (0600):
-public material, the wallet's master fingerprint, the profile and the device its code names, and the
-wallets' names. Each `signer_accounts` row names its `seed`, a Bitcoin one its roster `key` too, and carries
+Accounts are kept in `accounts.sealed.json` in the module's own directory, readable by its owner alone
+(0600), one document per seed (the signer interface's `sealed::SealedDocs`): its accounts, with the
+profile and the device its code names, and its wallet's name. Each document is sealed under the module's
+key for that seed, `data_key({ seed: <master fingerprint>, scope: "accounts" })` from the signer manager
+through `logos.wallets/1`, and is read only while the seed is unlocked:
+
+- The module asks for the keys of its closed seeds when it starts and whenever `wallets_changed` says a
+  wallet changed, from threads of its own, never while answering the manager. `wallets_locked` closes
+  every seed and asks again, as only some may have locked.
+- A locked seed's accounts aren't listed. An add while its seed is sealed and locked waits in memory and
+  joins the seed's document when it unlocks; a Keycard Shell's add unlocks it itself, since registering
+  the seed with its unlock key does.
+- A seed with no key yet, as one just added, keeps its document in memory until the key comes. A generic
+  wallet's accounts stay so until a password is set for it in the Signer app, and go with a restart
+  before that.
+- `accounts.json`, from before, is not read.
+
+Each `signer_accounts` row names its `seed`, a Bitcoin one its roster `key` too, and carries
 the signer interface's `origin`: the wallet as the device (`kind: "qr"`, named by the model its code names,
 else its profile, as `name` and `model`, with its `profile`), and `phrase` as `{ id: "fp:<fingerprint>",
 name }`. Ids are as the Keycard Shell's USB module names them: the address for EVM,
@@ -129,7 +144,8 @@ loop on the module's main thread. Before the module unloads, waiting calls are a
 - `cargo test --no-default-features --features emulator`: the UR types, the fountain codes, accounts against
   BIP84's and BIP86's xpubs, the v forms, and end to end against `qr-device-emulator` with the scanner in
   process: the unlock key equal to the mock signer's for the same seed at index 0 and 1, the seed
-  registered at add with it or without it, the guards, a 0600 `accounts.json`, and the signer interface's
+  registered at add with it or without it, the guards, accounts sealed per seed in a 0600 file and read
+  only while the seed is unlocked, an add while locked joining at unlock, and the signer interface's
   conformance suite for both profiles.
 - **The emulator** (`nix build .#emulator`) is a QR wallet in software behind the QR helper's fake mode: it
   reads the frames the helper would show, signs with the signer interface's mock keys, and holds up its

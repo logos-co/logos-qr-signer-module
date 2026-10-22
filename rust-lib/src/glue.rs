@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use logos_signer_interface::json as signer_json;
+use logos_signer_interface::wallets::{read_data_key, DataKey, DataKeyRequest};
 use logos_signer_interface::JobState;
 use serde_json::{json, Value};
 
@@ -103,6 +104,70 @@ impl Events for Emit {
             emit_signer_accounts_changed(count as i64);
         }
     }
+}
+
+/// A seed's accounts open with this module's key for it, which the signer manager gives once the
+/// person unlocks the wallet in the Signer app, and close when it locks. Asked from threads of their
+/// own, never while answering the manager, which would wait on itself.
+fn watch_wallets(qr: QrSigner) {
+    let mut client = wallets::WalletsClient::bind(WALLETS);
+    let changed = client.on_wallets_changed();
+    let locked = client.on_wallets_locked();
+    let q = qr.clone();
+    std::thread::spawn(move || {
+        open_wallets(&q);
+        if let Ok(sub) = changed {
+            for _ in sub {
+                open_wallets(&q);
+            }
+        }
+    });
+    if let Ok(sub) = locked {
+        std::thread::spawn(move || {
+            for _ in sub {
+                qr.lock_seeds();
+                // Only some may have locked.
+                open_wallets(&qr);
+            }
+        });
+    }
+}
+
+/// Every closed seed's key; a locked one answers `locked` and stays closed.
+fn open_wallets(qr: &QrSigner) {
+    for (seed, sealed_under) in qr.closed_seeds() {
+        if UNLOADING.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(current) = data_key(&seed, None) else {
+            continue;
+        };
+        let box_key = match sealed_under {
+            Some(g) if g != current.generation => match data_key(&seed, Some(g)) {
+                Some(k) => k,
+                None => continue,
+            },
+            _ => current.clone(),
+        };
+        if let Err(e) = qr.open_seed(&seed, &box_key, &current) {
+            eprintln!("qr_signer_module: a wallet's accounts didn't open: {e}");
+        }
+    }
+}
+
+/// The key for a seed's document, the seed named as this module names it: its master fingerprint.
+fn data_key(seed: &str, generation: Option<u32>) -> Option<DataKey> {
+    let body = serde_json::to_string(&DataKeyRequest {
+        seed: seed.to_string(),
+        scope: "accounts".into(),
+        generation,
+    })
+    .ok()?;
+    let (tx, rx) = sync_channel(1);
+    wallets::WalletsClient::bind(WALLETS).data_key_async_with_timeout(&body, BUDGET, move |r| {
+        let _ = tx.send(r);
+    });
+    read_data_key(&wait(rx).ok()?).ok()
 }
 
 fn wait<T>(rx: Receiver<Result<T, logos_rust_sdk::LogosError>>) -> Result<T, String> {
@@ -359,9 +424,13 @@ impl QrSignerModule for QrSignerModuleImpl {
     }
 
     fn on_context_ready(&self, ctx: &RustModuleContext) {
-        // The accounts offered live in the module's own directory.
+        // The accounts offered live in the module's own directory, each seed's sealed until the
+        // signer manager gives its key.
         match Store::open(&ctx.instance_persistence_path) {
-            Ok(store) => self.qr.set_store(store),
+            Ok(store) => {
+                self.qr.set_store(store);
+                watch_wallets(self.qr.clone());
+            }
             Err(e) => eprintln!("qr_signer_module: {}: {e}", ctx.instance_persistence_path),
         }
     }

@@ -26,7 +26,7 @@ path = "src/bin/psbt_for.rs"
 required-features = ["emulator"]
 
 [dependencies]
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "ca091a9330d455a5b60b80537e34dc535d1e6503", features = ["psbt"] }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "832fb948ef8bb1efd8e08a95eac483b96f70a567", features = ["psbt"] }
 # PSBTs, BIP32 keys and secp256k1. The plugin's export list keeps libsecp256k1 in.
 bitcoin = { version = "0.32.102", default-features = false, features = ["std", "base64"] }
 # Bytewords and the fountain codes of BC-UR; our own CBOR, in the CDDL's key order.
@@ -50,7 +50,7 @@ sha2 = { version = "0.10", optional = true }
 logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
 
 [dev-dependencies]
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "ca091a9330d455a5b60b80537e34dc535d1e6503", features = ["psbt", "mock", "conformance"] }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "832fb948ef8bb1efd8e08a95eac483b96f70a567", features = ["psbt", "mock", "conformance"] }
 
 [features]
 default = ["logos_module"]

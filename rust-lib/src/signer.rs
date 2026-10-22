@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use bitcoin::secp256k1::ecdsa;
 use bitcoin::Psbt;
 use logos_signer_interface::jobs::{JobTable, KeyJobs};
+use logos_signer_interface::wallets::DataKey;
 use logos_signer_interface::{
     psbt as shared, unlock, verify, Account, Collects, ErrorCode, Family, JobState, JobStatus,
     Payload, RequestKind, Result, Secret, SignRequest, Signature, Signer, SignerError, SignerInfo,
@@ -422,6 +423,38 @@ impl QrSigner {
 
     pub fn offered(&self) -> Vec<Offered> {
         lock(&self.shared.store).list().to_vec()
+    }
+
+    /// The seeds whose accounts wait for their key from the signer manager, each with the
+    /// generation its document is sealed under.
+    pub fn closed_seeds(&self) -> Vec<(String, Option<u32>)> {
+        lock(&self.shared.store).closed()
+    }
+
+    /// A seed's key arrived: its accounts are offered.
+    pub fn open_seed(
+        &self,
+        seed: &str,
+        box_key: &DataKey,
+        current: &DataKey,
+    ) -> std::io::Result<()> {
+        let count = {
+            let mut store = lock(&self.shared.store);
+            store.unlock(seed, box_key, current)?;
+            store.list().len()
+        };
+        self.shared.events.accounts_changed(count);
+        Ok(())
+    }
+
+    /// Wallets were locked: nothing of theirs is offered.
+    pub fn lock_seeds(&self) {
+        let count = {
+            let mut store = lock(&self.shared.store);
+            store.lock();
+            store.list().len()
+        };
+        self.shared.events.accounts_changed(count);
     }
 
     /// Read a wallet's account code and offer the accounts of these families. An account scan
