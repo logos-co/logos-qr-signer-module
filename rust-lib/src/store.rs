@@ -126,9 +126,26 @@ impl Store {
             wallets: self.wallets.clone(),
         })?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body)?;
+        write_private(&tmp, &body)?;
         std::fs::rename(tmp, path)
     }
+}
+
+/// Written readable by its owner only (0600 where the system has modes).
+fn write_private(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        // A file left from before keeps its mode: set it.
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    options.open(path)?.write_all(body)
 }
 
 /// EVM addresses compare without case; other ids exactly.

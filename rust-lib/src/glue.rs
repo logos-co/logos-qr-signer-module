@@ -24,6 +24,13 @@ pub trait QrSignerModule: Send + Sync + 'static {
     fn sign_status(&self, job: String) -> String;
     fn sign_result(&self, job: String) -> String;
     fn cancel_sign(&self, job: String) -> String;
+    /// A seed's unlock key, for the signer manager alone: `{ seed, index }` → `{ ok, job }`; the
+    /// job waits in `confirm_on_device` while the request shows and its answer is read.
+    fn unlock_key(&self, request_json: String) -> String;
+    fn unlock_key_status(&self, job: String) -> String;
+    /// `{ ok, job, key }`, once: the job forgets it.
+    fn unlock_key_result(&self, job: String) -> String;
+    fn cancel_unlock_key(&self, job: String) -> String;
 
     // ── the QR signer's app ─────────────────────────────────────────────
     /// The wallets it knows by name: `{ ok, profiles: [{ name, label }] }`.
@@ -63,9 +70,29 @@ static UNLOADING: AtomicBool = AtomicBool::new(false);
 /// How long one call to the scanner may take; a session itself lasts as long as the person needs.
 const BUDGET: Duration = Duration::from_secs(20);
 
+/// The module behind `logos.wallets/1`: the signer manager, bound at runtime, since it depends on
+/// this module and this module can't depend on it.
+const WALLETS: &str = "signer_manager_module";
+
+fn from_manager() -> bool {
+    matches!(logos_rust_sdk::current_caller(), logos_rust_sdk::LogosCaller::Module { name, .. } if name == WALLETS)
+}
+
 struct Emit;
 
 impl Events for Emit {
+    /// The seed goes to the signer manager while its unlock key is at hand, so the person never
+    /// unlocks it a second time. Asked without waiting: without a manager the add stands.
+    fn seed_added(&self, seed: &str, unlock_key: Option<[u8; 33]>, name: &str) {
+        if UNLOADING.load(Ordering::SeqCst) {
+            return;
+        }
+        let body = zeroize::Zeroizing::new(
+            json!({ "seed": seed, "kind": "qr", "unlockKey": unlock_key.map(hex::encode), "name": name })
+                .to_string(),
+        );
+        wallets::WalletsClient::bind(WALLETS).enroll_seed_async(&body, |_| {});
+    }
     fn sign_progress(&self, job: &str, state: JobState) {
         if !UNLOADING.load(Ordering::SeqCst) {
             emit_sign_progress(job, state.as_str());
@@ -223,6 +250,34 @@ impl QrSignerModule for QrSignerModuleImpl {
 
     fn cancel_sign(&self, job: String) -> String {
         signer_json::cancel_sign(&mut self.qr.clone(), &job)
+    }
+
+    fn unlock_key(&self, request_json: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::unlock_key(&mut self.qr.clone(), &request_json)
+    }
+
+    fn unlock_key_status(&self, job: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::unlock_key_status(&mut self.qr.clone(), &job)
+    }
+
+    fn unlock_key_result(&self, job: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::unlock_key_result(&mut self.qr.clone(), &job)
+    }
+
+    fn cancel_unlock_key(&self, job: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::cancel_unlock_key(&mut self.qr.clone(), &job)
     }
 
     fn profiles(&self) -> String {
