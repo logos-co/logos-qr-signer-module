@@ -4,6 +4,7 @@
 use bitcoin::bip32::{ChainCode, ChildNumber, Fingerprint, Xpub};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
 use bitcoin::NetworkKind;
+use logos_signer_interface::unlock;
 use logos_signer_interface::{Account, Chain, Family};
 use sha3::{Digest, Keccak256};
 
@@ -53,6 +54,25 @@ pub struct Offered {
     pub key: String,
     /// Which wallet it is, for what its codes can hold: see [`crate::profile`].
     pub profile: String,
+    /// The device its account code names, such as "Keycard Shell" or "Keystone 3 Pro".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+}
+
+impl Offered {
+    /// The account as signers list it: its seed, the wallet's master fingerprint, and a Bitcoin
+    /// account's roster key, worked out again for rows kept before they were.
+    pub fn listed(&self) -> Account {
+        let mut a = self.account.clone();
+        a.seed.get_or_insert_with(|| hex::encode(self.fingerprint));
+        if a.key.is_none() && a.family.is_bitcoin() {
+            a.key = a
+                .xpub
+                .as_deref()
+                .and_then(|x| unlock::roster_key(a.family, a.chain, x).ok());
+        }
+        a
+    }
 }
 
 fn account_key(k: &HdKey) -> Result<(PublicKey, [u8; 32], Vec<u32>), String> {
@@ -76,6 +96,7 @@ fn bitcoin_account(
     family: Family,
     profile: &str,
     label: Option<String>,
+    device: Option<String>,
 ) -> Result<Offered, String> {
     let (key, chain_code, path) = account_key(k)?;
     let [purpose, coin, account] =
@@ -101,6 +122,8 @@ fn bitcoin_account(
         chain_code: ChainCode::from(chain_code),
     };
     let fph = hex::encode(fp);
+    let xpub = xpub.to_string();
+    let roster = unlock::roster_key(family, Some(chain), &xpub).map_err(|e| e.message)?;
     Ok(Offered {
         account: Account {
             id: format!(
@@ -112,15 +135,18 @@ fn bitcoin_account(
             family,
             chain: Some(chain),
             path: Some(path_string(&path)),
-            fingerprint: Some(fph),
+            fingerprint: Some(fph.clone()),
             address: None,
-            xpub: Some(xpub.to_string()),
+            xpub: Some(xpub),
+            key: Some(roster),
+            seed: Some(fph),
             label,
             available: true,
         },
         fingerprint: fp,
         key: hex::encode(key.serialize()),
         profile: profile.to_string(),
+        device,
     })
 }
 
@@ -130,6 +156,7 @@ fn evm_account(
     k: &HdKey,
     profile: &str,
     label: Option<String>,
+    device: Option<String>,
 ) -> Result<Offered, String> {
     let (key, chain_code, path) = account_key(k)?;
     let (key, path) = match path.as_slice() {
@@ -169,24 +196,28 @@ fn evm_account(
             fingerprint: Some(hex::encode(fp)),
             address: Some(address),
             xpub: None,
+            key: None,
+            seed: Some(hex::encode(fp)),
             label,
             available: true,
         },
         fingerprint: fp,
         key: hex::encode(key.serialize()),
         profile: profile.to_string(),
+        device,
     })
 }
 
-/// The accounts of the asked families in what the wallet showed, in that order.
+/// The accounts of the asked families in what the wallet showed, in that order, each named by
+/// `label_of` or not at all.
 pub fn offered(
     found: &Accounts,
     families: &[Family],
     profile: &str,
-    label: Option<&str>,
+    label_of: impl Fn(Family) -> Option<String>,
 ) -> Result<Vec<Offered>, String> {
     let fp = found.master_fingerprint.to_be_bytes();
-    let label = || label.map(str::to_string);
+    let device = || found.device.clone();
     let mut out = Vec::new();
     for family in families {
         let made = match family {
@@ -212,7 +243,7 @@ pub fn offered(
                             })
                             .cloned()
                     })
-                    .map(|k| bitcoin_account(fp, &k, *family, profile, label()))
+                    .map(|k| bitcoin_account(fp, &k, *family, profile, label_of(*family), device()))
             }
             Family::Evm => found
                 .keys
@@ -223,7 +254,7 @@ pub fn offered(
                         .as_ref()
                         .is_some_and(|p| p.components.starts_with(&[HARDENED | 44, HARDENED | 60]))
                 })
-                .map(|k| evm_account(fp, k, profile, label())),
+                .map(|k| evm_account(fp, k, profile, label_of(Family::Evm), device())),
         };
         match made {
             Some(r) => out.push(r?),
@@ -335,7 +366,7 @@ mod tests {
             &shown(),
             &[Family::Bitcoin, Family::BitcoinTaproot],
             "generic",
-            None,
+            |_| None,
         )
         .unwrap();
         // BIP84's and BIP86's account 0 xpubs for the same mnemonic, as xpubs.
@@ -350,11 +381,24 @@ mod tests {
         assert_eq!(got[0].account.id, "qr-73c5da0a-84-0-0");
         assert_eq!(got[1].account.path.as_deref(), Some("m/86'/0'/0'"));
         assert_eq!(got[0].account.chain, Some(Chain::Main));
+        for o in &got {
+            let a = &o.account;
+            assert_eq!(a.seed.as_deref(), Some("73c5da0a"));
+            let key = a.key.as_deref().unwrap();
+            unlock::check_xpub(key, a.family, a.chain, a.xpub.as_deref().unwrap()).unwrap();
+        }
+        // A row kept before seeds and roster keys were: both come back when it is listed.
+        let mut old = got[0].clone();
+        (old.account.key, old.account.seed) = (None, None);
+        assert_eq!(old.listed(), got[0].account);
     }
 
     #[test]
     fn the_first_evm_address() {
-        let got = offered(&shown(), &[Family::Evm], "keycard_shell", Some("Shell")).unwrap();
+        let got = offered(&shown(), &[Family::Evm], "keycard_shell", |_| {
+            Some("Shell".into())
+        })
+        .unwrap();
         assert_eq!(
             got[0].account.id,
             "0x9858effd232b4033e47d90003d41ec34ecaeda94"
@@ -367,7 +411,7 @@ mod tests {
     fn a_family_the_code_lacks_is_named() {
         let mut a = shown();
         a.outputs.clear();
-        let e = offered(&a, &[Family::BitcoinTaproot], "generic", None).unwrap_err();
+        let e = offered(&a, &[Family::BitcoinTaproot], "generic", |_| None).unwrap_err();
         assert!(e.contains("taproot"), "{e}");
         assert!(e.contains("a key at m/44'/60'/0'"), "{e}");
     }

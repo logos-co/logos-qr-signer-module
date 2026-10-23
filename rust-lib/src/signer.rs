@@ -1,20 +1,27 @@
 //! The QR signer behind `logos.signer/1`. A request is written as animated UR codes and shown
 //! through the scanner; the wallet's answer is read back through the same session's camera. Only
 //! the answer's type is taken, and the manager checks every signature, as for any device.
+//!
+//! A seed's unlock key is the key a message signature at `m/1280263247'/n'` recovers to: one
+//! request and answer, when a Keycard Shell is added and each time the manager asks.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bitcoin::secp256k1::ecdsa;
 use bitcoin::Psbt;
-use logos_signer_interface::jobs::JobTable;
+use logos_signer_interface::jobs::{JobTable, KeyJobs};
+use logos_signer_interface::wallets::DataKey;
 use logos_signer_interface::{
-    psbt as shared, Account, Collects, ErrorCode, Family, JobState, JobStatus, Payload,
-    RequestKind, Result, SignRequest, Signature, Signer, SignerError, SignerInfo,
+    psbt as shared, unlock, verify, Account, Collects, ErrorCode, Family, JobState, JobStatus,
+    Payload, RequestKind, Result, Secret, SignRequest, Signature, Signer, SignerError, SignerInfo,
+    UnlockKey, UnlockKeyRequest,
 };
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Keccak256};
+use zeroize::Zeroizing;
 
 use crate::accounts::{self, Offered};
 use crate::parts::{self, Assembler, Progress};
@@ -25,6 +32,10 @@ use crate::ur::{self, EthDataType, EthSignRequest, Keypath};
 fn err(code: ErrorCode, m: impl Into<String>) -> SignerError {
     SignerError::new(code, m)
 }
+
+/// What the wallet shows when asked for its seed's unlock key.
+pub const UNLOCK_MESSAGE: &str =
+    "Logos: unlock this wallet's data on this computer. Signing this moves no funds.";
 
 /// The scanner module, as the signer sees it.
 pub trait Scanner: Send + Sync {
@@ -79,6 +90,9 @@ pub struct ScanProblem {
 pub trait Events: Send + Sync {
     fn sign_progress(&self, job: &str, state: JobState);
     fn accounts_changed(&self, count: usize);
+    /// Accounts of a seed were added, with its unlock key at index 0 when the wallet gave it: the
+    /// glue registers the seed with the signer manager.
+    fn seed_added(&self, _seed: &str, _unlock_key: Option<[u8; 33]>, _name: &str) {}
 }
 
 /// `scan_accounts`'s parameters.
@@ -86,6 +100,11 @@ pub trait Events: Send + Sync {
 #[serde(deny_unknown_fields)]
 pub struct ScanRequest {
     pub families: Vec<Family>,
+    /// An optional name for each account added, by family (`evm`, `bitcoin`, `bitcoin_taproot`).
+    /// None by default: one name never goes to several accounts.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    /// One name, only for a scan that adds one account.
     #[serde(default)]
     pub label: Option<String>,
     /// Which wallet; read from the code where it says, else `generic`.
@@ -93,13 +112,80 @@ pub struct ScanRequest {
     pub profile: Option<String>,
 }
 
+/// A family as `scan_accounts`'s `families` and `labels` name it.
+fn wire(f: Family) -> &'static str {
+    match f {
+        Family::Evm => "evm",
+        Family::Bitcoin => "bitcoin",
+        Family::BitcoinTaproot => "bitcoin_taproot",
+    }
+}
+
+impl ScanRequest {
+    /// Each named family's name: from `labels`, or `label` when one family is asked for. Blank
+    /// names are none.
+    fn names(&self) -> Result<Vec<(Family, String)>> {
+        let invalid = |m: String| err(ErrorCode::Invalid, m);
+        let mut out = Vec::new();
+        if let Some(label) = self
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+        {
+            if self.families.len() != 1 || !self.labels.is_empty() {
+                return Err(invalid(
+                    "one name for several accounts: name each in labels".into(),
+                ));
+            }
+            out.push((self.families[0], label.to_string()));
+        }
+        for (key, name) in &self.labels {
+            let family = self
+                .families
+                .iter()
+                .copied()
+                .find(|f| wire(*f) == key)
+                .ok_or_else(|| invalid(format!("labels names {key}, which isn't asked for")))?;
+            let name = name.trim();
+            if !name.is_empty() {
+                out.push((family, name.to_string()));
+            }
+        }
+        if out.iter().any(|(_, n)| n.chars().count() > 80) {
+            return Err(invalid("a name is at most 80 characters".into()));
+        }
+        Ok(out)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Added {
-    /// `scanning`, `done` or `failed`.
+    /// `scanning`, `done`, `failed` or `cancelled`.
     pub state: &'static str,
+    /// While scanning: `account_code`, then `unlock_key` while the seed's unlock key is asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<&'static str>,
     pub accounts: Vec<Account>,
+    /// Once done: whether the wallet gave its seed's unlock key. Without it the wallet unlocks by
+    /// a password.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unlock_key: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl Added {
+    fn ended(state: &'static str, error: Option<String>) -> Added {
+        Added {
+            state,
+            step: None,
+            accounts: Vec::new(),
+            unlock_key: None,
+            error,
+        }
+    }
 }
 
 enum Work {
@@ -115,11 +201,22 @@ enum Work {
 
 impl Work {
     fn of(o: &Offered, payload: &Payload, p: &Profile) -> Result<Work> {
-        let path = o
+        let invalid = |m: &str| err(ErrorCode::Invalid, m);
+        let path_str = o
             .account
             .path
             .as_deref()
-            .and_then(accounts::parse_path)
+            .ok_or_else(|| err(ErrorCode::Internal, "an account without its path"))?;
+        // An edited accounts.json can put a row anywhere.
+        if unlock::is_reserved(path_str) {
+            return Err(invalid("nothing signs under the unlock keys' purpose"));
+        }
+        if o.account.family == Family::Evm && !unlock::evm_path_ok(path_str) {
+            return Err(invalid(
+                "this EVM account's path is not under m/44'/60': add it again",
+            ));
+        }
+        let path = accounts::parse_path(path_str)
             .ok_or_else(|| err(ErrorCode::Internal, "an account without its path"))?;
         match (o.account.family, payload) {
             (Family::Bitcoin | Family::BitcoinTaproot, Payload::BtcPsbt { psbt, .. }) => {
@@ -133,6 +230,11 @@ impl Work {
                             "a {} signs at most {} inputs and {} outputs",
                             p.label, p.max_inputs, p.max_outputs
                         ),
+                    ));
+                }
+                if reserved_origin(&psbt) {
+                    return Err(invalid(
+                        "the PSBT names a key under the unlock keys' purpose",
                     ));
                 }
                 shared::check_inputs(&psbt, o.account.family, o.fingerprint, &path)?;
@@ -176,6 +278,54 @@ impl Work {
     }
 }
 
+/// Whether a PSBT names any key under the reserved purpose, in or out.
+fn reserved_origin(psbt: &Psbt) -> bool {
+    let reserved = |path: &bitcoin::bip32::DerivationPath| {
+        path.into_iter()
+            .next()
+            .is_some_and(|c| u32::from(*c) & !accounts::HARDENED == unlock::PURPOSE)
+    };
+    let inputs = psbt.inputs.iter().flat_map(|i| {
+        i.bip32_derivation
+            .values()
+            .chain(i.tap_key_origins.values().map(|(_, s)| s))
+    });
+    let outputs = psbt.outputs.iter().flat_map(|o| {
+        o.bip32_derivation
+            .values()
+            .chain(o.tap_key_origins.values().map(|(_, s)| s))
+    });
+    psbt.xpub
+        .values()
+        .chain(inputs)
+        .chain(outputs)
+        .any(|(_, path)| reserved(path))
+}
+
+/// A Bitcoin request may bring its wallet's xpub; one that isn't this account's is refused.
+fn check_brought(account: &Account, xpub: Option<&str>) -> Result<()> {
+    let (Some(brought), Some(listed)) = (xpub, account.xpub.as_deref()) else {
+        return Ok(());
+    };
+    let (family, chain) = (account.family, account.chain);
+    let key = unlock::roster_key(family, chain, listed)?;
+    unlock::check_xpub(&key, family, chain, brought).map_err(|_| {
+        err(
+            ErrorCode::Invalid,
+            "the request's xpub is not this account's",
+        )
+    })
+}
+
+/// A version 4 UUID, as a request's id.
+fn request_id() -> [u8; 16] {
+    let mut id = [0u8; 16];
+    getrandom::fill(&mut id).expect("the system's random source");
+    id[6] = (id[6] & 0x0f) | 0x40;
+    id[8] = (id[8] & 0x3f) | 0x80;
+    id
+}
+
 fn evm(
     o: &Offered,
     data_type: EthDataType,
@@ -183,11 +333,7 @@ fn evm(
     chain_id: Option<i64>,
     path: Vec<u32>,
 ) -> Work {
-    let mut request_id = [0u8; 16];
-    getrandom::fill(&mut request_id).expect("the system's random source");
-    // Version 4, as a UUID's bits say.
-    request_id[6] = (request_id[6] & 0x0f) | 0x40;
-    request_id[8] = (request_id[8] & 0x3f) | 0x80;
+    let request_id = request_id();
     let address = o
         .account
         .address
@@ -214,7 +360,7 @@ fn evm(
 
 /// The recovery id an `eth-signature`'s v stands for, whichever way the wallet wrote it: 0 or 1,
 /// 27 or 28, or EIP-155's chain id times two plus 35, whole or as its low byte. Then S made low.
-fn evm_signature(sig: &[u8], key: &str) -> Result<Signature> {
+fn recoverable(sig: &[u8]) -> Result<([u8; 64], u8)> {
     let bad = || err(ErrorCode::Invalid, "the wallet's signature is malformed");
     let (rs, v) = sig.split_at_checked(64).ok_or_else(bad)?;
     let last = *v.last().ok_or_else(bad)?;
@@ -229,18 +375,42 @@ fn evm_signature(sig: &[u8], key: &str) -> Result<Signature> {
     if s != before {
         id ^= 1;
     }
+    Ok((s.serialize_compact(), id))
+}
+
+fn evm_signature(sig: &[u8], key: &str) -> Result<Signature> {
+    let (rs, id) = recoverable(sig)?;
     Ok(Signature {
         item: 0,
-        signature: hex::encode(s.serialize_compact()),
+        signature: hex::encode(rs),
         recovery_id: Some(id),
         pubkey: key.to_string(),
     })
+}
+
+/// `personal_sign`'s digest of a message.
+pub fn eip191(message: &[u8]) -> [u8; 32] {
+    let mut h = Keccak256::new();
+    h.update(format!("\x19Ethereum Signed Message:\n{}", message.len()).as_bytes());
+    h.update(message);
+    h.finalize().into()
+}
+
+/// The unlock key: the key the wallet's signature of [`UNLOCK_MESSAGE`] recovers to.
+fn unlock_key_from(sig: &[u8]) -> Result<[u8; 33]> {
+    let (rs, id) = recoverable(sig)?;
+    let key = verify::recover_key(&eip191(UNLOCK_MESSAGE.as_bytes()), &rs, id)?;
+    bitcoin::secp256k1::PublicKey::from_slice(&key.to_sec1_bytes())
+        .map(|k| k.serialize())
+        .map_err(|e| err(ErrorCode::Invalid, format!("the recovered key: {e}")))
 }
 
 struct Shared {
     scanner: Arc<dyn Scanner>,
     store: Mutex<Store>,
     jobs: Mutex<JobTable>,
+    /// Unlock-key jobs: read once, by the manager only, and announced nowhere.
+    keys: Mutex<KeyJobs>,
     adds: Mutex<HashMap<String, Added>>,
     events: Box<dyn Events>,
     seq: AtomicU64,
@@ -286,6 +456,7 @@ impl QrSigner {
                 scanner,
                 store: Mutex::new(store),
                 jobs: Mutex::new(JobTable::new()),
+                keys: Mutex::new(KeyJobs::new()),
                 adds: Mutex::new(HashMap::new()),
                 events,
                 seq: AtomicU64::new(0),
@@ -306,12 +477,45 @@ impl QrSigner {
         lock(&self.shared.store).list().to_vec()
     }
 
+    /// The seeds whose accounts wait for their key from the signer manager, each with the
+    /// generation its document is sealed under.
+    pub fn closed_seeds(&self) -> Vec<(String, Option<u32>)> {
+        lock(&self.shared.store).closed()
+    }
+
+    /// A seed's key arrived: its accounts are offered.
+    pub fn open_seed(
+        &self,
+        seed: &str,
+        box_key: &DataKey,
+        current: &DataKey,
+    ) -> std::io::Result<()> {
+        let count = {
+            let mut store = lock(&self.shared.store);
+            store.unlock(seed, box_key, current)?;
+            store.list().len()
+        };
+        self.shared.events.accounts_changed(count);
+        Ok(())
+    }
+
+    /// Wallets were locked: nothing of theirs is offered.
+    pub fn lock_seeds(&self) {
+        let count = {
+            let mut store = lock(&self.shared.store);
+            store.lock();
+            store.list().len()
+        };
+        self.shared.events.accounts_changed(count);
+    }
+
     /// Read a wallet's account code and offer the accounts of these families. An account scan
     /// still running gives way: it is the same person trying again. A signature in progress doesn't.
     pub fn scan_accounts(&self, req: ScanRequest) -> Result<String> {
         if req.families.is_empty() {
             return Err(err(ErrorCode::Invalid, "no families asked for"));
         }
+        req.names()?;
         let busy = || err(ErrorCode::Busy, "the QR signer is already reading a code");
         if self.shared.busy.swap(true, Ordering::SeqCst) {
             let running = lock(&self.shared.scan)
@@ -334,7 +538,9 @@ impl QrSigner {
             id.clone(),
             Added {
                 state: "scanning",
+                step: Some("account_code"),
                 accounts: Vec::new(),
+                unlock_key: None,
                 error: None,
             },
         );
@@ -343,22 +549,16 @@ impl QrSigner {
         let shared = self.shared.clone();
         let job = id.clone();
         std::thread::spawn(move || {
-            let added = match shared.add(&req, &stop) {
-                Ok(accounts) => Added {
+            let added = match shared.add(&job, &req, &stop) {
+                Ok((accounts, unlock_key)) => Added {
                     state: "done",
+                    step: None,
                     accounts,
+                    unlock_key: Some(unlock_key),
                     error: None,
                 },
-                Err(_) if stop.load(Ordering::SeqCst) => Added {
-                    state: "cancelled",
-                    accounts: Vec::new(),
-                    error: None,
-                },
-                Err(e) => Added {
-                    state: "failed",
-                    accounts: Vec::new(),
-                    error: Some(e.message),
-                },
+                Err(_) if stop.load(Ordering::SeqCst) => Added::ended("cancelled", None),
+                Err(e) => Added::ended("failed", Some(e.message)),
             };
             lock(&shared.adds).insert(job.clone(), added);
             // The outcome first, then the scan, then the scanner: whoever replaces it finds all said.
@@ -466,8 +666,14 @@ impl QrSigner {
             .iter()
             .map(|o| {
                 let fp = hex::encode(o.fingerprint);
+                // The device's own model when its code names one, so it doesn't show as any QR wallet.
+                let model = o
+                    .device
+                    .clone()
+                    .unwrap_or_else(|| profile::get(&o.profile).label.to_string());
                 let device = serde_json::json!({
-                    "id": format!("qr-{fp}"), "kind": "qr", "name": profile::get(&o.profile).label
+                    "id": format!("qr-{fp}"), "kind": "qr", "name": model, "model": model,
+                    "profile": o.profile
                 });
                 let phrase =
                     serde_json::json!({ "id": format!("fp:{fp}"), "name": store.wallet_name(&fp) });
@@ -580,7 +786,8 @@ impl Shared {
         outcome
     }
 
-    fn add(&self, req: &ScanRequest, stop: &AtomicBool) -> Result<Vec<Account>> {
+    /// The accounts added, and whether the wallet gave its seed's unlock key.
+    fn add(&self, job: &str, req: &ScanRequest, stop: &AtomicBool) -> Result<(Vec<Account>, bool)> {
         let expect = [
             "crypto-account",
             "crypto-multi-accounts",
@@ -601,17 +808,107 @@ impl Shared {
             .clone()
             .or_else(|| profile::for_device(found.device.as_deref()).map(str::to_string))
             .unwrap_or_else(|| profile::GENERIC.name.to_string());
-        let made = accounts::offered(&found, &req.families, &profile, req.label.as_deref())
+        let names = req.names()?;
+        let label_of = |f: Family| {
+            names
+                .iter()
+                .find(|(family, _)| *family == f)
+                .map(|(_, n)| n.clone())
+        };
+        let made = accounts::offered(&found, &req.families, &profile, label_of)
             .map_err(|e| err(ErrorCode::Invalid, e))?;
-        let count = {
+        let p = profile::get(&profile);
+        let fingerprint = found.master_fingerprint.to_be_bytes();
+        let seed = hex::encode(fingerprint);
+        // One more request and answer: the seed's unlock key, so adding never asks twice. A wallet
+        // that doesn't give it still adds; its wallet then unlocks by a password.
+        let unlock_key = if p.unlocks_by_key {
+            if let Some(a) = lock(&self.adds).get_mut(job) {
+                a.step = Some("unlock_key");
+            }
+            match self.unlock_key_from_wallet("Add a QR wallet", fingerprint, &p, 0, &stopped) {
+                Ok(key) => Some(Zeroizing::new(key)),
+                Err(e) if stopped() => return Err(e),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let (count, name) = {
             let mut store = lock(&self.store);
             store
                 .put(made.clone())
                 .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
-            store.list().len()
+            // The wallet's own name, never an account's.
+            let name = store
+                .wallet_name(&seed)
+                .map(str::to_string)
+                .filter(|n| !n.trim().is_empty())
+                .or_else(|| found.device.clone())
+                .unwrap_or_else(|| p.label.to_string());
+            (store.list().len(), name)
         };
         self.events.accounts_changed(count);
-        Ok(made.into_iter().map(|o| o.account).collect())
+        self.events
+            .seed_added(&seed, unlock_key.as_deref().copied(), &name);
+        Ok((
+            made.iter().map(Offered::listed).collect(),
+            unlock_key.is_some(),
+        ))
+    }
+
+    /// One request and answer: the wallet signs [`UNLOCK_MESSAGE`] at `m/1280263247'/<index>'`
+    /// under its master fingerprint, and the key comes out of the signature.
+    fn unlock_key_from_wallet(
+        &self,
+        title: &str,
+        fingerprint: [u8; 4],
+        p: &Profile,
+        index: u32,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<[u8; 33]> {
+        let path = accounts::parse_path(&unlock::unlock_key_path(index)?)
+            .ok_or_else(|| err(ErrorCode::Internal, "the unlock key's path"))?;
+        let request = EthSignRequest {
+            request_id: request_id(),
+            sign_data: UNLOCK_MESSAGE.as_bytes().to_vec(),
+            data_type: EthDataType::RawBytes,
+            chain_id: None,
+            path: Keypath {
+                depth: Some(path.len() as u8),
+                components: path,
+                source_fingerprint: Some(u32::from_be_bytes(fingerprint)),
+            },
+            address: None,
+            origin: Some("Logos".into()),
+        };
+        let cbor =
+            ur::eth_sign_request(&request).map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+        let show = Request {
+            ur_type: "eth-sign-request",
+            cbor: &cbor,
+            profile: p,
+        };
+        let Ended::Answer(_, answer) = self.session(
+            title,
+            Some(show),
+            "",
+            &["eth-signature"],
+            stopped,
+            self.patience,
+        )?
+        else {
+            return Err(err(ErrorCode::Refused, "cancelled"));
+        };
+        let s =
+            ur::read_eth_signature(&answer).map_err(|e| err(ErrorCode::Invalid, e.to_string()))?;
+        if s.request_id.is_some_and(|id| id != request.request_id) {
+            return Err(err(
+                ErrorCode::Invalid,
+                "the wallet answered another request",
+            ));
+        }
+        unlock_key_from(&s.signature)
     }
 
     fn run(&self, job: &str, o: &Offered, work: Work) -> Result<Vec<Signature>> {
@@ -691,6 +988,7 @@ impl Signer for QrSigner {
             ],
             shows_request: true,
             collects: Collects::Nothing,
+            unlock_key: true,
         }
     }
 
@@ -698,7 +996,7 @@ impl Signer for QrSigner {
         Ok(lock(&self.shared.store)
             .list()
             .iter()
-            .map(|o| o.account.clone())
+            .map(Offered::listed)
             .collect())
     }
 
@@ -712,6 +1010,7 @@ impl Signer for QrSigner {
                     format!("no account {}", request.account),
                 )
             })?;
+        check_brought(&offered.account, request.xpub.as_deref())?;
         let work = Work::of(&offered, &request.payload, &profile::get(&offered.profile))?;
         if self.shared.busy.swap(true, Ordering::SeqCst) {
             return Err(err(
@@ -752,6 +1051,73 @@ impl Signer for QrSigner {
         lock(&self.shared.jobs).cancel(job)?;
         self.shared.events.sign_progress(job, JobState::Cancelled);
         Ok(())
+    }
+
+    /// A seed's unlock key: one request and answer, as for a signature, on no event. The job
+    /// waits in `confirm_on_device` while the codes show.
+    fn unlock_key(&mut self, request: UnlockKeyRequest) -> Result<String> {
+        unlock::unlock_key_path(request.index)?;
+        let seed = request.seed.trim().to_ascii_lowercase();
+        let (fingerprint, p) = {
+            let store = lock(&self.shared.store);
+            let listed = store
+                .list()
+                .iter()
+                .find(|o| hex::encode(o.fingerprint) == seed)
+                .map(|o| (o.fingerprint, profile::get(&o.profile)));
+            // A locked wallet lists nothing and its profile is sealed: the request is one small
+            // code, which the generic profile's sizes carry to any wallet.
+            let sealed = || {
+                let fp: [u8; 4] = hex::decode(&seed).ok()?.try_into().ok()?;
+                store.knows(&seed).then_some((fp, profile::GENERIC))
+            };
+            listed
+                .or_else(sealed)
+                .ok_or_else(|| err(ErrorCode::WrongSeed, "no QR account comes from this seed"))?
+        };
+        if self.shared.busy.swap(true, Ordering::SeqCst) {
+            return Err(err(
+                ErrorCode::Busy,
+                "the QR signer is already reading a code",
+            ));
+        }
+        let job = lock(&self.shared.keys).start(JobState::ConfirmOnDevice);
+        let shared = self.shared.clone();
+        let id = job.clone();
+        std::thread::spawn(move || {
+            // Cancelled, or swept once settled: either way nobody waits for it.
+            let stopped = || {
+                lock(&shared.keys)
+                    .status(&id)
+                    .map_or(true, |s| s.state.is_final())
+            };
+            let outcome = shared
+                .unlock_key_from_wallet(
+                    "Unlock with your QR wallet",
+                    fingerprint,
+                    &p,
+                    request.index,
+                    &stopped,
+                )
+                .map(|key| UnlockKey {
+                    key: Secret::new(hex::encode(Zeroizing::new(key).as_slice())),
+                });
+            shared.busy.store(false, Ordering::SeqCst);
+            let _ = lock(&shared.keys).finish(&id, outcome);
+        });
+        Ok(job)
+    }
+
+    fn unlock_key_status(&mut self, job: &str) -> Result<JobStatus> {
+        lock(&self.shared.keys).status(job)
+    }
+
+    fn unlock_key_result(&mut self, job: &str) -> Result<UnlockKey> {
+        lock(&self.shared.keys).take(job)
+    }
+
+    fn cancel_unlock_key(&mut self, job: &str) -> Result<()> {
+        lock(&self.shared.keys).cancel(job)
     }
 }
 

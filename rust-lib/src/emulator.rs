@@ -1,7 +1,9 @@
 //! A QR wallet in software, for tests and doctests: the other end of the QR helper's fake mode. It
 //! reads the codes the helper would show, signs with the signer interface's mock keys, presses the
 //! window's button as a person would, and holds its answer up to the "camera" as pictures of QR codes.
-//! Asked to scan with nothing shown, it shows its accounts, as a wallet's connect screen does.
+//! Asked to scan with nothing shown, it shows its accounts, as a wallet's connect screen does. A
+//! message at the unlock keys' purpose it signs with the key at the path asked for, as the Keycard
+//! Shell does.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -11,15 +13,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
-use bitcoin::secp256k1::{ecdsa, schnorr, Secp256k1};
+use bitcoin::secp256k1::{ecdsa, schnorr, Message, Secp256k1};
 use bitcoin::{NetworkKind, Psbt};
 use logos_signer_interface::mock::{MockOptions, MockSigner, PHRASE};
+use logos_signer_interface::{unlock, verify};
 use logos_signer_interface::{Family, Payload, RequestKind, SignRequest, Signer};
 use qrcodegen::{QrCode, QrCodeEcc};
 use serde::Deserialize;
 
+use crate::accounts::HARDENED;
 use crate::parts::{self, Assembler};
-use crate::ur::{self, Accounts, EthDataType, EthSignature, HdKey, Keypath};
+use crate::ur::{self, Accounts, EthDataType, EthSignRequest, EthSignature, HdKey, Keypath};
 
 #[derive(Clone)]
 pub struct Emulator {
@@ -182,6 +186,11 @@ impl Emulator {
         };
         if t == "eth-sign-request" {
             let r = ur::read_eth_sign_request(&cbor).ok()?;
+            let reserved =
+                r.path.components.first().map(|c| c & !HARDENED) == Some(unlock::PURPOSE);
+            if reserved && r.data_type == EthDataType::RawBytes {
+                return self.sign_at_path(&r);
+            }
             let payload = match r.data_type {
                 EthDataType::Transaction | EthDataType::TypedTransaction => {
                     Payload::EvmTransaction {
@@ -199,6 +208,7 @@ impl Emulator {
                     account: id_of(Family::Evm)?,
                     payload,
                     secret: None,
+                    xpub: None,
                 })
                 .ok()?;
             let sig = mock.result(&job).ok()?.into_iter().next()?;
@@ -239,6 +249,7 @@ impl Emulator {
                     psbt: b64,
                 },
                 secret: None,
+                xpub: None,
             })
             .ok()?;
         for sig in mock.result(&job).ok()? {
@@ -260,6 +271,35 @@ impl Emulator {
             }
         }
         parts::parts("crypto-psbt", &ur::psbt(&psbt.serialize()), 200).ok()
+    }
+
+    /// A message signed with the key at the request's own path, v as `personal_sign` writes it.
+    fn sign_at_path(&self, r: &EthSignRequest) -> Option<Vec<String>> {
+        let secp = Secp256k1::new();
+        let root = Xpriv::new_master(NetworkKind::Test, &self.seed()).ok()?;
+        let path: Vec<ChildNumber> = r
+            .path
+            .components
+            .iter()
+            .map(|c| ChildNumber::from(*c))
+            .collect();
+        let at = root.derive_priv(&secp, &path).ok()?;
+        let digest = crate::signer::eip191(&r.sign_data);
+        let rs = secp
+            .sign_ecdsa(&Message::from_digest(digest), &at.private_key)
+            .serialize_compact();
+        let key = at.private_key.public_key(&secp).serialize();
+        let id = (0u8..2).find(|id| {
+            verify::recover_key(&digest, &rs, *id).is_ok_and(|k| k.to_sec1_bytes().as_ref() == key)
+        })?;
+        let mut signature = rs.to_vec();
+        signature.push(27 + id);
+        let cbor = ur::eth_signature(&EthSignature {
+            request_id: Some(r.request_id),
+            signature,
+        })
+        .ok()?;
+        parts::parts("eth-signature", &cbor, 200).ok()
     }
 
     /// One helper's session: what it shows is read, and once it scans, the answer is held up over
