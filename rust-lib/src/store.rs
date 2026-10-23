@@ -136,6 +136,13 @@ impl Store {
         &self.offered
     }
 
+    /// Whether some account comes from this seed, listed or sealed while it is locked.
+    pub fn knows(&self, seed: &str) -> bool {
+        self.offered.iter().any(|o| seed_of(o) == seed)
+            || self.docs.seeds().iter().any(|s| s == seed)
+            || self.waiting.contains_key(seed)
+    }
+
     pub fn find(&self, id: &str) -> Option<&Offered> {
         self.offered.iter().find(|o| same(&o.account, id))
     }

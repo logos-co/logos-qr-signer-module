@@ -61,7 +61,8 @@ Shell's card refuses them.
 - **`unlock_key`** (`{ seed, index }`, the signer manager alone) returns a job in `confirm_on_device`
   while the request shows and its answer is read, in a scanner session titled "Unlock with your QR
   wallet", so whichever app draws signing sessions draws it too. `unlock_key_result` gives the key once.
-  A seed no account comes from is `wrong_seed`. A QR wallet can't be asked which seed it holds: another
+  A seed no account comes from is `wrong_seed`; a locked wallet's seed is known, though its accounts
+  aren't listed, and its request then takes the generic profile's sizes, since its profile is sealed. A QR wallet can't be asked which seed it holds: another
   wallet's answer gives another key, which the manager finds unwraps nothing.
 - Anyone who photographs the wallet's answer can recover that seed's key at that index; the manager then
   moves the seed to its next index.

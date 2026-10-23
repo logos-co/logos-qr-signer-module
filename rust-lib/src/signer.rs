@@ -1058,12 +1058,23 @@ impl Signer for QrSigner {
     fn unlock_key(&mut self, request: UnlockKeyRequest) -> Result<String> {
         unlock::unlock_key_path(request.index)?;
         let seed = request.seed.trim().to_ascii_lowercase();
-        let (fingerprint, p) = lock(&self.shared.store)
-            .list()
-            .iter()
-            .find(|o| hex::encode(o.fingerprint) == seed)
-            .map(|o| (o.fingerprint, profile::get(&o.profile)))
-            .ok_or_else(|| err(ErrorCode::WrongSeed, "no QR account comes from this seed"))?;
+        let (fingerprint, p) = {
+            let store = lock(&self.shared.store);
+            let listed = store
+                .list()
+                .iter()
+                .find(|o| hex::encode(o.fingerprint) == seed)
+                .map(|o| (o.fingerprint, profile::get(&o.profile)));
+            // A locked wallet lists nothing and its profile is sealed: the request is one small
+            // code, which the generic profile's sizes carry to any wallet.
+            let sealed = || {
+                let fp: [u8; 4] = hex::decode(&seed).ok()?.try_into().ok()?;
+                store.knows(&seed).then_some((fp, profile::GENERIC))
+            };
+            listed
+                .or_else(sealed)
+                .ok_or_else(|| err(ErrorCode::WrongSeed, "no QR account comes from this seed"))?
+        };
         if self.shared.busy.swap(true, Ordering::SeqCst) {
             return Err(err(
                 ErrorCode::Busy,

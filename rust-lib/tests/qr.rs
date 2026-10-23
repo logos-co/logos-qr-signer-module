@@ -429,6 +429,43 @@ fn a_seeds_unlock_key_is_the_same_each_time_and_another_at_the_next_index() {
 }
 
 #[test]
+fn a_locked_wallet_still_unlocks() {
+    let d = dir("locked-unlock");
+    let r = rig(
+        Emulator::default(),
+        Store::open(&d).unwrap(),
+        Duration::from_secs(20),
+    );
+    scan_all(&r.signer);
+    let seed = seed_of(&r.signer);
+    r.signer
+        .open_seed(&seed, &data_key(1, 0), &data_key(1, 0))
+        .unwrap();
+    // After a restart: sealed and locked, so nothing is listed, yet the manager can ask for the key
+    // that unlocks it.
+    let mut again = rig(
+        Emulator::default(),
+        Store::open(&d).unwrap(),
+        Duration::from_secs(20),
+    );
+    assert!(again.signer.accounts().unwrap().is_empty());
+    let key = unlock_key(&mut again.signer, &seed, 0).unwrap();
+    assert_eq!(key.key.expose(), mocks_unlock_key(0));
+    assert_eq!(
+        again.scanner.shown.lock().unwrap().len(),
+        1,
+        "one request shown"
+    );
+    assert_eq!(
+        unlock_key(&mut again.signer, "00000000", 0)
+            .unwrap_err()
+            .code,
+        ErrorCode::WrongSeed
+    );
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
 fn only_a_seed_it_holds_unlocks() {
     let (mut s, scanner) = signer(Emulator::default());
     scan_all(&s);
