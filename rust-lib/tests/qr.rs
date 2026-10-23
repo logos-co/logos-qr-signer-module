@@ -1,7 +1,7 @@
 //! The QR signer end to end against the emulated wallet, with the scanner in process: codes pass as
 //! text, so this covers the signer and the UR types; the helper and its decoders have their own.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -161,6 +161,7 @@ fn dir(name: &str) -> PathBuf {
 fn all_families() -> ScanRequest {
     ScanRequest {
         families: vec![Family::Evm, Family::Bitcoin, Family::BitcoinTaproot],
+        labels: BTreeMap::new(),
         label: None,
         profile: None,
     }
@@ -271,6 +272,54 @@ fn accounts_come_from_the_wallets_code() {
         assert!(xpub.starts_with("tpub"));
         unlock::check_xpub(a.key.as_deref().unwrap(), a.family, a.chain, xpub).unwrap();
     }
+}
+
+#[test]
+fn each_account_added_gets_its_own_name_or_none() {
+    let r = rig(Emulator::default(), Store::new(), Duration::from_secs(20));
+    let mut req = all_families();
+    req.labels.insert("bitcoin".into(), " Cold ".into());
+    req.labels.insert("evm".into(), " ".into());
+    let job = r.signer.scan_accounts(req).unwrap();
+    assert_eq!(scanned(&r.signer, &job), "done");
+    let names: Vec<Option<String>> = r
+        .signer
+        .offered()
+        .iter()
+        .map(|o| o.account.label.clone())
+        .collect();
+    assert_eq!(names, vec![None, Some("Cold".into()), None]);
+    // The wallet is registered under its own name, not an account's.
+    assert_eq!(r.heard.0.lock().unwrap()[0].2, "Keycard Shell (emulated)");
+
+    // One name for several accounts is refused before anything is read.
+    let refused = |req: ScanRequest| r.signer.scan_accounts(req).unwrap_err().code;
+    let mut one_for_all = all_families();
+    one_for_all.label = Some("Main".into());
+    assert_eq!(refused(one_for_all), ErrorCode::Invalid);
+    let mut unasked = all_families();
+    unasked.families = vec![Family::Evm];
+    unasked.labels.insert("bitcoin".into(), "Cold".into());
+    assert_eq!(refused(unasked), ErrorCode::Invalid);
+    let mut long = all_families();
+    long.labels.insert("evm".into(), "x".repeat(81));
+    assert_eq!(refused(long), ErrorCode::Invalid);
+
+    // A single account still takes `label`.
+    let job = r
+        .signer
+        .scan_accounts(ScanRequest {
+            families: vec![Family::BitcoinTaproot],
+            labels: BTreeMap::new(),
+            label: Some("Spending".into()),
+            profile: None,
+        })
+        .unwrap();
+    assert_eq!(scanned(&r.signer, &job), "done");
+    assert_eq!(
+        account(&r.signer, Family::BitcoinTaproot).label.as_deref(),
+        Some("Spending")
+    );
 }
 
 #[test]

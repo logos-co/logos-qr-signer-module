@@ -208,15 +208,15 @@ fn evm_account(
     })
 }
 
-/// The accounts of the asked families in what the wallet showed, in that order.
+/// The accounts of the asked families in what the wallet showed, in that order, each named by
+/// `label_of` or not at all.
 pub fn offered(
     found: &Accounts,
     families: &[Family],
     profile: &str,
-    label: Option<&str>,
+    label_of: impl Fn(Family) -> Option<String>,
 ) -> Result<Vec<Offered>, String> {
     let fp = found.master_fingerprint.to_be_bytes();
-    let label = || label.map(str::to_string);
     let device = || found.device.clone();
     let mut out = Vec::new();
     for family in families {
@@ -243,7 +243,7 @@ pub fn offered(
                             })
                             .cloned()
                     })
-                    .map(|k| bitcoin_account(fp, &k, *family, profile, label(), device()))
+                    .map(|k| bitcoin_account(fp, &k, *family, profile, label_of(*family), device()))
             }
             Family::Evm => found
                 .keys
@@ -254,7 +254,7 @@ pub fn offered(
                         .as_ref()
                         .is_some_and(|p| p.components.starts_with(&[HARDENED | 44, HARDENED | 60]))
                 })
-                .map(|k| evm_account(fp, k, profile, label(), device())),
+                .map(|k| evm_account(fp, k, profile, label_of(Family::Evm), device())),
         };
         match made {
             Some(r) => out.push(r?),
@@ -366,7 +366,7 @@ mod tests {
             &shown(),
             &[Family::Bitcoin, Family::BitcoinTaproot],
             "generic",
-            None,
+            |_| None,
         )
         .unwrap();
         // BIP84's and BIP86's account 0 xpubs for the same mnemonic, as xpubs.
@@ -395,7 +395,10 @@ mod tests {
 
     #[test]
     fn the_first_evm_address() {
-        let got = offered(&shown(), &[Family::Evm], "keycard_shell", Some("Shell")).unwrap();
+        let got = offered(&shown(), &[Family::Evm], "keycard_shell", |_| {
+            Some("Shell".into())
+        })
+        .unwrap();
         assert_eq!(
             got[0].account.id,
             "0x9858effd232b4033e47d90003d41ec34ecaeda94"
@@ -408,7 +411,7 @@ mod tests {
     fn a_family_the_code_lacks_is_named() {
         let mut a = shown();
         a.outputs.clear();
-        let e = offered(&a, &[Family::BitcoinTaproot], "generic", None).unwrap_err();
+        let e = offered(&a, &[Family::BitcoinTaproot], "generic", |_| None).unwrap_err();
         assert!(e.contains("taproot"), "{e}");
         assert!(e.contains("a key at m/44'/60'/0'"), "{e}");
     }

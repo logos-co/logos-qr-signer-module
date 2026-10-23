@@ -94,7 +94,7 @@ For the app:
 | Method | Parameters | Answer |
 |---|---|---|
 | `profiles` | | `{ ok, profiles: [{ name, label }] }` |
-| `scan_accounts` | `{ families, label?, profile? }` | `{ ok, job }`. Reads the wallet's account code and offers an account of each family it holds: `evm`, `bitcoin` (native segwit, BIP84) and `bitcoin_taproot` (BIP86) |
+| `scan_accounts` | `{ families, labels?, label?, profile? }` | `{ ok, job }`. Reads the wallet's account code and offers an account of each family it holds: `evm`, `bitcoin` (native segwit, BIP84) and `bitcoin_taproot` (BIP86). `labels` names each account by its family (`{ "bitcoin": "Savings" }`), up to 80 characters; an account it doesn't name has none, and apps show its kind. `label` names the one account of a scan that asks for one family; one name for several accounts is refused (`invalid`) |
 | `add_status` | `job` | `{ ok, job, state, step?, accounts, unlockKey?, error? }`, `state` being `scanning`, `done`, `failed` or `cancelled`. While scanning, `step` is `account_code`, then `unlock_key` while the seed's unlock key is asked for; once done, `unlockKey` says whether the wallet gave it |
 | `cancel_scan` | `job` | `{ ok, cancelled }`, whether the scan was still running |
 | `remove_account` | `id` | `{ ok, removed }`. Nothing on the wallet changes |

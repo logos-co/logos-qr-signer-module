@@ -36,8 +36,8 @@ pub trait QrSignerModule: Send + Sync + 'static {
     // ── the QR signer's app ─────────────────────────────────────────────
     /// The wallets it knows by name: `{ ok, profiles: [{ name, label }] }`.
     fn profiles(&self) -> String;
-    /// Read a wallet's account code and offer accounts of these families:
-    /// `{ families, label?, profile? }` → `{ ok, job }`.
+    /// Read a wallet's account code and offer accounts of these families, each with its own name
+    /// or none: `{ families, labels?: { <family>: name }, label?, profile? }` → `{ ok, job }`.
     fn scan_accounts(&self, params_json: String) -> String;
     /// A scan's progress: `{ ok, job, state, accounts, error? }`.
     fn add_status(&self, job: String) -> String;

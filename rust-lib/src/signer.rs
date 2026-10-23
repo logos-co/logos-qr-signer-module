@@ -5,7 +5,7 @@
 //! A seed's unlock key is the key a message signature at `m/1280263247'/n'` recovers to: one
 //! request and answer, when a Keycard Shell is added and each time the manager asks.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -100,11 +100,63 @@ pub trait Events: Send + Sync {
 #[serde(deny_unknown_fields)]
 pub struct ScanRequest {
     pub families: Vec<Family>,
+    /// An optional name for each account added, by family (`evm`, `bitcoin`, `bitcoin_taproot`).
+    /// None by default: one name never goes to several accounts.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    /// One name, only for a scan that adds one account.
     #[serde(default)]
     pub label: Option<String>,
     /// Which wallet; read from the code where it says, else `generic`.
     #[serde(default)]
     pub profile: Option<String>,
+}
+
+/// A family as `scan_accounts`'s `families` and `labels` name it.
+fn wire(f: Family) -> &'static str {
+    match f {
+        Family::Evm => "evm",
+        Family::Bitcoin => "bitcoin",
+        Family::BitcoinTaproot => "bitcoin_taproot",
+    }
+}
+
+impl ScanRequest {
+    /// Each named family's name: from `labels`, or `label` when one family is asked for. Blank
+    /// names are none.
+    fn names(&self) -> Result<Vec<(Family, String)>> {
+        let invalid = |m: String| err(ErrorCode::Invalid, m);
+        let mut out = Vec::new();
+        if let Some(label) = self
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+        {
+            if self.families.len() != 1 || !self.labels.is_empty() {
+                return Err(invalid(
+                    "one name for several accounts: name each in labels".into(),
+                ));
+            }
+            out.push((self.families[0], label.to_string()));
+        }
+        for (key, name) in &self.labels {
+            let family = self
+                .families
+                .iter()
+                .copied()
+                .find(|f| wire(*f) == key)
+                .ok_or_else(|| invalid(format!("labels names {key}, which isn't asked for")))?;
+            let name = name.trim();
+            if !name.is_empty() {
+                out.push((family, name.to_string()));
+            }
+        }
+        if out.iter().any(|(_, n)| n.chars().count() > 80) {
+            return Err(invalid("a name is at most 80 characters".into()));
+        }
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -463,6 +515,7 @@ impl QrSigner {
         if req.families.is_empty() {
             return Err(err(ErrorCode::Invalid, "no families asked for"));
         }
+        req.names()?;
         let busy = || err(ErrorCode::Busy, "the QR signer is already reading a code");
         if self.shared.busy.swap(true, Ordering::SeqCst) {
             let running = lock(&self.shared.scan)
@@ -755,7 +808,14 @@ impl Shared {
             .clone()
             .or_else(|| profile::for_device(found.device.as_deref()).map(str::to_string))
             .unwrap_or_else(|| profile::GENERIC.name.to_string());
-        let made = accounts::offered(&found, &req.families, &profile, req.label.as_deref())
+        let names = req.names()?;
+        let label_of = |f: Family| {
+            names
+                .iter()
+                .find(|(family, _)| *family == f)
+                .map(|(_, n)| n.clone())
+        };
+        let made = accounts::offered(&found, &req.families, &profile, label_of)
             .map_err(|e| err(ErrorCode::Invalid, e))?;
         let p = profile::get(&profile);
         let fingerprint = found.master_fingerprint.to_be_bytes();
@@ -779,10 +839,10 @@ impl Shared {
             store
                 .put(made.clone())
                 .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
-            let name = req
-                .label
-                .clone()
-                .or_else(|| store.wallet_name(&seed).map(str::to_string))
+            // The wallet's own name, never an account's.
+            let name = store
+                .wallet_name(&seed)
+                .map(str::to_string)
                 .filter(|n| !n.trim().is_empty())
                 .or_else(|| found.device.clone())
                 .unwrap_or_else(|| p.label.to_string());
