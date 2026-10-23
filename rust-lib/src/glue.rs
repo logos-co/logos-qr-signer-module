@@ -429,7 +429,10 @@ impl QrSignerModule for QrSignerModuleImpl {
         match Store::open(&ctx.instance_persistence_path) {
             Ok(store) => {
                 self.qr.set_store(store);
-                watch_wallets(self.qr.clone());
+                // Off this callback: subscribing waits for the manager's connection in a nested
+                // event loop, which would dispatch other calls inside it.
+                let qr = self.qr.clone();
+                std::thread::spawn(move || watch_wallets(qr));
             }
             Err(e) => eprintln!("qr_signer_module: {}: {e}", ctx.instance_persistence_path),
         }

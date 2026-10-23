@@ -109,7 +109,9 @@ key for that seed, `data_key({ seed: <master fingerprint>, scope: "accounts" })`
 through `logos.wallets/1`, and is read only while the seed is unlocked:
 
 - The module asks for the keys of its closed seeds when it starts and whenever `wallets_changed` says a
-  wallet changed, from threads of its own, never while answering the manager. `wallets_locked` closes
+  wallet changed, from threads of its own, never while answering the manager. It subscribes, and
+  registers a seed it adds, from threads of its own too: a call's first connection to the manager waits
+  in a nested event loop, which would dispatch other calls inside it. `wallets_locked` closes
   every seed and asks again, as only some may have locked.
 - A locked seed's accounts aren't listed. An add while its seed is sealed and locked waits in memory and
   joins the seed's document when it unlocks; a Keycard Shell's add unlocks it itself, since registering
