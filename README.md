@@ -6,9 +6,9 @@ signer manager lists its accounts and hands it requests like any device. The cam
 `qr_scanner_module`; this module holds no secret. See [docs/specs.md](docs/specs.md).
 
 ```sh
-logoscore call qr_signer_module scan_accounts '{"families":["evm","bitcoin","bitcoin_taproot"]}'
-logoscore call qr_signer_module add_status <job>          # done, once the wallet's code is read
-logoscore call qr_signer_module signer_accounts
+logosctl call qr_signer_module scan_accounts '{"families":["evm","bitcoin","bitcoin_taproot"]}'
+logosctl call qr_signer_module add_status <job>          # done, once the wallet's code is read
+logosctl call qr_signer_module signer_accounts
 ```
 
 ## Build and test
