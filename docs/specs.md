@@ -94,13 +94,13 @@ loop on the module's main thread. Before the module unloads, waiting calls are a
   answer as pictures of QR codes. Asked to scan with nothing shown, it shows its accounts.
   `qr-psbt-for` makes a PSBT spending two made-up coins of an account, for the doctest and by hand.
 - **The doctest** runs the signer, the scanner, the helper in fake mode, the emulator and the signer
-  manager through `logoscore`.
+  manager through `logosctl`.
 
 ## By hand
 
 With a Keycard Shell and a camera:
 
-1. Load `qr_scanner_module`, `qr_signer_module` and the signer manager in a `logoscore` daemon.
+1. Load `qr_scanner_module`, `qr_signer_module` and the signer manager in a `logosctl` daemon.
 2. `scan_accounts` with the families wanted; on the Shell, Connect software wallet. The Logos QR window
    reads its code.
 3. Sign a message, an EVM transaction and a PSBT from `qr-psbt-for` through the manager: each request shows
