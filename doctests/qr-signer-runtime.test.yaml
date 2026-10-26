@@ -8,11 +8,11 @@ intro: |
   wallet's answer is read back through the camera. The module holds no secret, and the camera belongs
   to `qr_scanner_module`.
 
-  This doc-test runs headless through `logoscore`. The scanner's helper runs in fake mode: instead of a
+  This doc-test runs headless through `logosctl`. The scanner's helper runs in fake mode: instead of a
   camera and a window, it talks to `qr-device-emulator`, a QR wallet in software that reads the codes it
   would be shown, signs with test keys, and holds up its answer as pictures of QR codes.
 
-what_you_build: "The QR signer, the QR scanner, the signer manager and an emulated QR wallet, driven through a `logoscore` daemon."
+what_you_build: "The QR signer, the QR scanner, the signer manager and an emulated QR wallet, driven through a `logosctl` daemon."
 
 what_you_learn:
   - How accounts are added from a wallet's account code
@@ -24,17 +24,14 @@ prerequisites:
   - "**A Linux or macOS machine.** Everything here is offline, and no camera or wallet is needed."
 
 sections:
-  - title: "Build logoscore and lgpm"
+  - title: "Build logosctl"
     step: true
     steps:
-      - title: "Build logoscore"
-        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
-        check_file: "logos/bin/logoscore"
-      - title: "Build lgpm"
-        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
-        check_file: "lgpm/bin/lgpm"
+      - title: "Build logosctl"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos"
+        check_file: "logos/bin/logosctl"
 
-  - title: "Build and install the modules"
+  - title: "Build the modules"
     step: true
     text: |
       The scanner is pinned to the commit this signer is built against. The manager's doc-test probe
@@ -55,18 +52,6 @@ sections:
         expect_contains:
           - "qr-device-emulator"
           - "qr-psbt-for"
-      - title: "Install them"
-        run: |
-          mkdir -p modules
-          cp -RL ./logos/modules/. ./modules/
-          chmod -R u+w modules
-          for p in signer scanner keystore manager probe; do ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file $p-lgx/*.lgx; done
-          ./lgpm/bin/lgpm --modules-dir ./modules list
-        code_block: "lgpm --modules-dir ./modules --allow-unsigned install --file signer-lgx/*.lgx"
-        expect_contains:
-          - "qr_signer_module"
-          - "qr_scanner_module"
-          - "manager_probe"
 
   - title: "An emulated wallet, and the daemon"
     step: true
@@ -78,22 +63,37 @@ sections:
           - "127.0.0.1:"
       - title: "Start the daemon, the scanner's helper pointed at it"
         text: "Without `LOGOS_QR_HELPER_FAKE`, the helper opens the camera and a window."
-        run: "sh -c 'LOGOS_QR_HELPER_FAKE=$(cat wallet.addr) ./logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
-        code_block: "LOGOS_QR_HELPER_FAKE=127.0.0.1:<port> logoscore -D -m ./modules > logs.txt &"
-      - run: "sleep 3"
+        # The bundled package downloader starts a storage node in $HOME; keep it out of the real one.
+        run: "mkdir -p home && LOGOS_QR_HELPER_FAKE=$(cat wallet.addr) HOME=\"$PWD/home\" ./logos/bin/logosctl --config-dir ./session daemon start --detach"
+        code_block: "LOGOS_QR_HELPER_FAKE=127.0.0.1:<port> logosctl daemon start --detach"
+        expect_contains:
+          - "Daemon started"
+      - title: "Install them"
+        text: |
+          Copy the packages into `./packages` and install them all into the daemon's session. They are
+          unsigned local builds, which the default signature policy accepts with a warning.
+        run: |
+          mkdir -p packages && cp -f *-lgx/*.lgx packages/
+          ./logos/bin/logosctl --config-dir ./session install --dir packages -y
+          ./logos/bin/logosctl --config-dir ./session package ls
+        code_block: "logosctl install --dir packages -y"
+        expect_contains:
+          - "qr_signer_module"
+          - "qr_scanner_module"
+          - "manager_probe"
       - title: "Load the signer, with the scanner, and the probe with the manager"
         run: |
-          ./logos/bin/logoscore load-module qr_signer_module
-          ./logos/bin/logoscore load-module manager_probe
+          ./logos/bin/logosctl --config-dir ./session module load qr_signer_module
+          ./logos/bin/logosctl --config-dir ./session module load manager_probe
         code_block: |
-          logoscore load-module qr_signer_module
-          logoscore load-module manager_probe
+          logosctl module load qr_signer_module
+          logosctl module load manager_probe
         expect_contains:
           - "qr_scanner_module"
           - "signer_manager_module"
       - title: "It signs whole requests, which the wallet shows"
-        run: "./logos/bin/logoscore call qr_signer_module signer_info"
-        code_block: "logoscore call qr_signer_module signer_info"
+        run: "./logos/bin/logosctl --config-dir ./session call qr_signer_module signer_info"
+        code_block: "logosctl call qr_signer_module signer_info"
         expect_contains:
           - '\"kind\":\"qr\"'
           - '\"showsRequest\":true'
@@ -107,13 +107,13 @@ sections:
     steps:
       - title: "An EVM, a native segwit and a taproot account"
         run: |
-          ./logos/bin/logoscore call qr_signer_module scan_accounts '{"families":["evm","bitcoin","bitcoin_taproot"]}' > add.json
+          ./logos/bin/logosctl --config-dir ./session call qr_signer_module scan_accounts '{"families":["evm","bitcoin","bitcoin_taproot"]}' > add.json
           job=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])["job"])' add.json)
-          for i in $(seq 1 120); do ./logos/bin/logoscore call qr_signer_module add_status "$job" > added.json; grep -Eq 'state.....(done|failed)' added.json && break; sleep 0.5; done
+          for i in $(seq 1 120); do ./logos/bin/logosctl --config-dir ./session call qr_signer_module add_status "$job" > added.json; grep -Eq 'state.....(done|failed)' added.json && break; sleep 0.5; done
           cat added.json
         code_block: |
-          logoscore call qr_signer_module scan_accounts '{"families":["evm","bitcoin","bitcoin_taproot"]}'
-          logoscore call qr_signer_module add_status <job>     # done, once the code is read
+          logosctl call qr_signer_module scan_accounts '{"families":["evm","bitcoin","bitcoin_taproot"]}'
+          logosctl call qr_signer_module add_status <job>     # done, once the code is read
         expect_contains:
           - '\"state\":\"done\"'
           - '\"unlockKey\":true'
@@ -125,25 +125,25 @@ sections:
           Adding a Keycard Shell's accounts also asked for the seed's unlock key: one more message to sign,
           at `m/1280263247'/0'`, which the emulated wallet answered. The seed is its master fingerprint.
         run: |
-          ./logos/bin/logoscore call qr_signer_module signer_info
-          ./logos/bin/logoscore call qr_signer_module signer_accounts > seeds.json
+          ./logos/bin/logosctl --config-dir ./session call qr_signer_module signer_info
+          ./logos/bin/logosctl --config-dir ./session call qr_signer_module signer_accounts > seeds.json
           seed=$(python3 -c 'import json,sys; a=json.loads(json.load(open(sys.argv[1]))["result"])["accounts"]; s={x["seed"] for x in a}; assert len(s)==1 and all(x["key"].startswith("btc_") for x in a if x["family"]!="evm"), a; print(s.pop())' seeds.json)
           echo "one seed, $seed"
-          ./logos/bin/logoscore call qr_signer_module unlock_key "{\"seed\":\"$seed\",\"index\":0}"
+          ./logos/bin/logosctl --config-dir ./session call qr_signer_module unlock_key "{\"seed\":\"$seed\",\"index\":0}"
         code_block: |
-          logoscore call qr_signer_module signer_info                       # "unlockKey": true
-          logoscore call qr_signer_module unlock_key '{"seed":"<seed>","index":0}'   # refused: the CLI
+          logosctl call qr_signer_module signer_info                       # "unlockKey": true
+          logosctl call qr_signer_module unlock_key '{"seed":"<seed>","index":0}'   # refused: the CLI
         expect_contains:
           - '\"unlockKey\":true'
           - "one seed, "
           - "not authorized"
       - title: "The manager lists them under the QR signer"
         run: |
-          ./logos/bin/logoscore call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":["qr_signer_module"]}'
-          ./logos/bin/logoscore call signer_manager_module accounts
+          ./logos/bin/logosctl --config-dir ./session call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":["qr_signer_module"]}'
+          ./logos/bin/logosctl --config-dir ./session call signer_manager_module accounts
         code_block: |
-          logoscore call signer_manager_module configure '{…, "signers":["qr_signer_module"]}'
-          logoscore call signer_manager_module accounts
+          logosctl call signer_manager_module configure '{…, "signers":["qr_signer_module"]}'
+          logosctl call signer_manager_module accounts
         expect_contains:
           - '\"signer\":\"qr_signer_module\"'
 
@@ -157,31 +157,31 @@ sections:
       - title: "A message"
         run: |
           r() { python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' "$1" "$2"; }
-          ./logos/bin/logoscore call manager_probe request '{"address":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","purpose":"doc-test over QR","legs":[{"kind":"message","text":"signed over QR"}]}' > mreq.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe request '{"address":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","purpose":"doc-test over QR","legs":[{"kind":"message","text":"signed over QR"}]}' > mreq.json
           r mreq.json handle > mhandle; r mreq.json receipt > mreceipt
-          ./logos/bin/logoscore call manager_probe acknowledge "$(cat mhandle)" > mshown.json
-          ./logos/bin/logoscore call manager_probe approve "$(cat mhandle)" "$(r mshown.json bundle_id)" ""
-          for i in $(seq 1 60); do ./logos/bin/logoscore call manager_probe status "$(cat mhandle)" "$(cat mreceipt)" > mstatus.json; grep -q 'settled' mstatus.json && break; sleep 0.5; done
+          ./logos/bin/logosctl --config-dir ./session call manager_probe acknowledge "$(cat mhandle)" > mshown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat mhandle)" "$(r mshown.json bundle_id)" ""
+          for i in $(seq 1 60); do ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat mhandle)" "$(cat mreceipt)" > mstatus.json; grep -q 'settled' mstatus.json && break; sleep 0.5; done
           cat mstatus.json
-          ./logos/bin/logoscore call manager_probe fetch "$(cat mhandle)" "$(cat mreceipt)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe fetch "$(cat mhandle)" "$(cat mreceipt)"
         code_block: |
-          logoscore call manager_probe request '{"address":"0xf39F…2266","legs":[{"kind":"message","text":"signed over QR"}]}'
-          logoscore call manager_probe approve <handle> <bundle_id> ""   # the codes show; the wallet signs
-          logoscore call manager_probe fetch <handle> <receipt>
+          logosctl call manager_probe request '{"address":"0xf39F…2266","legs":[{"kind":"message","text":"signed over QR"}]}'
+          logosctl call manager_probe approve <handle> <bundle_id> ""   # the codes show; the wallet signs
+          logosctl call manager_probe fetch <handle> <receipt>
         expect_contains:
           - '\"reason\":\"approved\"'
           - '\"signed\":[\"0x'
       - title: "A Sepolia transaction"
         run: |
           r() { python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' "$1" "$2"; }
-          ./logos/bin/logoscore call manager_probe request '{"address":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","purpose":"doc-test over QR","legs":[{"kind":"tx","chain_id":11155111,"tx":{"to":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","value":"0x1","nonce":"0x0","gas_limit":"0x5208","fee_mode":"eip1559","max_fee_per_gas":"0x3b9aca00","max_priority_fee_per_gas":"0x1"}}]}' > treq.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe request '{"address":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","purpose":"doc-test over QR","legs":[{"kind":"tx","chain_id":11155111,"tx":{"to":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","value":"0x1","nonce":"0x0","gas_limit":"0x5208","fee_mode":"eip1559","max_fee_per_gas":"0x3b9aca00","max_priority_fee_per_gas":"0x1"}}]}' > treq.json
           r treq.json handle > thandle; r treq.json receipt > treceipt
-          ./logos/bin/logoscore call manager_probe acknowledge "$(cat thandle)" > tshown.json
-          ./logos/bin/logoscore call manager_probe approve "$(cat thandle)" "$(r tshown.json bundle_id)" ""
-          for i in $(seq 1 60); do ./logos/bin/logoscore call manager_probe status "$(cat thandle)" "$(cat treceipt)" > tstatus.json; grep -q 'settled' tstatus.json && break; sleep 0.5; done
+          ./logos/bin/logosctl --config-dir ./session call manager_probe acknowledge "$(cat thandle)" > tshown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat thandle)" "$(r tshown.json bundle_id)" ""
+          for i in $(seq 1 60); do ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat thandle)" "$(cat treceipt)" > tstatus.json; grep -q 'settled' tstatus.json && break; sleep 0.5; done
           cat tstatus.json
-          ./logos/bin/logoscore call manager_probe fetch "$(cat thandle)" "$(cat treceipt)"
-        code_block: "logoscore call manager_probe request '{…, \"legs\":[{\"kind\":\"tx\",\"chain_id\":11155111, …}]}'"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe fetch "$(cat thandle)" "$(cat treceipt)"
+        code_block: "logosctl call manager_probe request '{…, \"legs\":[{\"kind\":\"tx\",\"chain_id\":11155111, …}]}'"
         expect_contains:
           - '\"reason\":\"approved\"'
           - '\"signed\":[\"0x02'
@@ -189,18 +189,18 @@ sections:
         text: "`qr-psbt-for` makes the PSBT from the account's public key: its coins are made up, so it can be signed and never broadcast."
         run: |
           r() { python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' "$1" "$2"; }
-          ./logos/bin/logoscore call qr_signer_module signer_accounts > accounts.json
+          ./logos/bin/logosctl --config-dir ./session call qr_signer_module signer_accounts > accounts.json
           python3 -c 'import json,sys; a=[x for x in json.loads(json.load(open(sys.argv[1]))["result"])["accounts"] if x["family"]=="bitcoin"][0]; print(json.dumps(a))' accounts.json > segwit.json
           python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' segwit.json > group
           ./emulator/bin/qr-psbt-for < segwit.json > psbt.b64
           printf '{"group":"%s","purpose":"doc-test over QR","legs":[{"kind":"psbt","network":"regtest","psbt":"%s"}]}' "$(cat group)" "$(cat psbt.b64)" > pintent.json
-          ./logos/bin/logoscore call manager_probe request @pintent.json > preq.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe request @pintent.json > preq.json
           r preq.json handle > phandle; r preq.json receipt > preceipt
-          ./logos/bin/logoscore call manager_probe acknowledge "$(cat phandle)" > pshown.json
-          ./logos/bin/logoscore call manager_probe approve "$(cat phandle)" "$(r pshown.json bundle_id)" ""
-          for i in $(seq 1 60); do ./logos/bin/logoscore call manager_probe status "$(cat phandle)" "$(cat preceipt)" > pstatus.json; grep -q 'settled' pstatus.json && break; sleep 0.5; done
+          ./logos/bin/logosctl --config-dir ./session call manager_probe acknowledge "$(cat phandle)" > pshown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat phandle)" "$(r pshown.json bundle_id)" ""
+          for i in $(seq 1 60); do ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat phandle)" "$(cat preceipt)" > pstatus.json; grep -q 'settled' pstatus.json && break; sleep 0.5; done
           cat pstatus.json
-        code_block: "logoscore call manager_probe request '{\"group\":\"qr-…-84-1-0\",\"legs\":[{\"kind\":\"psbt\",\"network\":\"regtest\",\"psbt\":\"cHNidP8…\"}]}'"
+        code_block: "logosctl call manager_probe request '{\"group\":\"qr-…-84-1-0\",\"legs\":[{\"kind\":\"psbt\",\"network\":\"regtest\",\"psbt\":\"cHNidP8…\"}]}'"
         expect_contains:
           - '\"reason\":\"approved\"'
 
@@ -211,9 +211,9 @@ sections:
         text: "Nothing on the wallet changes; it can be added again."
         run: |
           id=$(python3 -c 'import json,sys; print([x for x in json.loads(json.load(open(sys.argv[1]))["result"])["accounts"] if x["family"]=="bitcoin_taproot"][0]["id"])' accounts.json)
-          ./logos/bin/logoscore call qr_signer_module remove_account "$id"
-          ./logos/bin/logoscore call qr_signer_module signer_accounts
-        code_block: "logoscore call qr_signer_module remove_account qr-…-86-1-0"
+          ./logos/bin/logosctl --config-dir ./session call qr_signer_module remove_account "$id"
+          ./logos/bin/logosctl --config-dir ./session call qr_signer_module signer_accounts
+        code_block: "logosctl call qr_signer_module remove_account qr-…-86-1-0"
         expect_contains:
           - '\"removed\":true'
           - "-84-1-0"
@@ -222,13 +222,13 @@ sections:
     step: true
     steps:
       - title: "Stop the daemon"
-        run: "./logos/bin/logoscore stop"
-        code_block: "logoscore stop"
+        run: "./logos/bin/logosctl --config-dir ./session daemon stop"
+        code_block: "logosctl daemon stop"
       - title: "Stop the emulated wallet"
         run: "kill $(cat wallet.pid)"
       - run: "sleep 2"
       - title: "Confirm the daemon has stopped"
-        run: "./logos/bin/logoscore status || true"
-        code_block: "logoscore status"
+        run: "./logos/bin/logosctl --config-dir ./session daemon status || true"
+        code_block: "logosctl daemon status"
         expect_contains:
           - '"status":"not_running"'
