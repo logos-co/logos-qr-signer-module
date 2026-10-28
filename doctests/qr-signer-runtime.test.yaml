@@ -34,8 +34,9 @@ sections:
   - title: "Build the modules"
     step: true
     text: |
-      The scanner is pinned to the commit this signer is built against. The manager's doc-test probe
-      plays the requester and the approver, as a wallet and the signer app do.
+      The scanner is pinned to the commit this signer is built against, and the manager to one that
+      tells a wallet's holders whether it has a way in. The manager's doc-test probe plays the
+      requester and the approver, as a wallet and the signer app do.
     steps:
       - title: "Build the signer, its emulator, the scanner, the manager and its probe"
         run: |
@@ -43,8 +44,8 @@ sections:
           nix build 'github:logos-co/logos-qr-signer-module{release}#emulator' --no-write-lock-file -o emulator
           nix build 'github:logos-co/logos-qr-scanner-module/bbf2a45ff2cd835c5fdda0ec5a1ae8ad62e2e643#lgx' --no-write-lock-file -o scanner-lgx
           nix build 'github:logos-co/logos-evm-keystore-module/c68b7b4d933f30f87e033e6a1d7865f298e4d858#lgx' --no-write-lock-file -o keystore-lgx
-          nix build 'github:logos-co/logos-signer-manager-module/80bc40ccbe6c689caadc736b3db2136bfbde1818#lgx' --no-write-lock-file -o manager-lgx
-          nix build 'github:logos-co/logos-signer-manager-module/80bc40ccbe6c689caadc736b3db2136bfbde1818?dir=doctests/manager-probe#lgx' --override-input signer_manager_module 'github:logos-co/logos-signer-manager-module/80bc40ccbe6c689caadc736b3db2136bfbde1818' --override-input keystore_module 'github:logos-co/logos-evm-keystore-module/c68b7b4d933f30f87e033e6a1d7865f298e4d858' --no-write-lock-file -o probe-lgx
+          nix build 'github:logos-co/logos-signer-manager-module/66acc9f3deacea3e2b27b6d60c45f910ee4573d4#lgx' --no-write-lock-file -o manager-lgx
+          nix build 'github:logos-co/logos-signer-manager-module/66acc9f3deacea3e2b27b6d60c45f910ee4573d4?dir=doctests/manager-probe#lgx' --override-input signer_manager_module 'github:logos-co/logos-signer-manager-module/66acc9f3deacea3e2b27b6d60c45f910ee4573d4' --override-input keystore_module 'github:logos-co/logos-evm-keystore-module/c68b7b4d933f30f87e033e6a1d7865f298e4d858' --no-write-lock-file -o probe-lgx
           ls signer-lgx/*.lgx emulator/bin/
         code_block: |
           nix build '.#lgx' -o signer-lgx
@@ -137,6 +138,18 @@ sections:
           - '\"unlockKey\":true'
           - "one seed, "
           - "not authorized"
+      - title: "The signer manager can unlock the wallet again"
+        text: |
+          The unlock key went to the signer manager, which made it the wallet's way in: the device alone,
+          until the person sets a password too. QR Wallets reads that back from the manager, and warns
+          about a wallet that has no way in.
+        run: |
+          for i in $(seq 1 60); do ./logos/bin/logosctl --config-dir ./session call qr_signer_module wallets > wallets.json; grep -q 'wayIn' wallets.json && break; sleep 0.5; done
+          cat wallets.json
+        code_block: 'logosctl call qr_signer_module wallets      # "unlockKey": true, "wayIn": true'
+        expect_contains:
+          - '\"unlockKey\":true'
+          - '\"wayIn\":true'
       - title: "The manager lists them under the QR signer"
         run: |
           ./logos/bin/logosctl --config-dir ./session call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":["qr_signer_module"]}'
