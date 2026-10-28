@@ -3,6 +3,7 @@
 //!
 //! Every reply is a JSON string: `{ "ok": true, ... }` or `{ "ok": false, "error": "...", "code"? }`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
@@ -14,7 +15,7 @@ use logos_signer_interface::JobState;
 use serde_json::{json, Value};
 
 use crate::profile;
-use crate::signer::{Events, QrSigner, ScanPoll, ScanRequest, Scanner, Show};
+use crate::signer::{Events, QrSigner, ScanPoll, ScanRequest, Scanner, SeedStatus, Show};
 use crate::store::Store;
 
 pub trait QrSignerModule: Send + Sync + 'static {
@@ -47,9 +48,14 @@ pub trait QrSignerModule: Send + Sync + 'static {
     fn remove_account(&self, id: String) -> String;
     /// Name an account for apps; a blank name clears it: `{ ok, renamed }`.
     fn rename_account(&self, id: String, label: String) -> String;
-    /// The wallets accounts came from, by master fingerprint, with the profile each follows and
-    /// the name given to it: `{ ok, wallets: [{ fingerprint, profile, label, name }] }`.
+    /// The wallets accounts came from, by master fingerprint, with the profile each follows, the
+    /// name given to it, and, once the signer manager says, whether its wallet has the seed's
+    /// unlock key and a way in after a restart: `{ ok, wallets: [{ fingerprint, profile, label,
+    /// name, unlockKey?, wayIn? }] }`.
     fn wallets(&self) -> String;
+    /// Ask a Shell added without its seed's unlock key for it, and give it to the signer manager:
+    /// `{ ok, job }`, followed with `add_status` and stopped with `cancel_scan`.
+    fn give_unlock_key(&self, seed: String) -> String;
     /// Name a wallet by its master fingerprint; a blank name clears it: `{ ok, renamed }`.
     fn rename_wallet(&self, fingerprint: String, name: String) -> String;
 
@@ -93,6 +99,36 @@ impl Events for Emit {
                 .to_string(),
         );
         wallets::WalletsClient::bind(WALLETS).enroll_seed_async(&body, |_| {});
+    }
+    fn seed_key_given(&self, seed: &str, unlock_key: [u8; 33], name: &str) -> Result<(), String> {
+        let body = zeroize::Zeroizing::new(
+            json!({ "seed": seed, "kind": "qr", "unlockKey": hex::encode(unlock_key), "name": name })
+                .to_string(),
+        );
+        let (tx, rx) = sync_channel(1);
+        wallets::WalletsClient::bind(WALLETS).enroll_seed_async_with_timeout(
+            &body,
+            BUDGET,
+            move |r| {
+                let _ = tx.send(r);
+            },
+        );
+        let raw = wait(rx).map_err(|_| "the signer manager didn't answer".to_string())?;
+        let v: Value =
+            serde_json::from_str(&raw).map_err(|e| format!("the signer manager's answer: {e}"))?;
+        if v["ok"] == true {
+            return Ok(());
+        }
+        // The seed is already another wallet's: adding this one again joins that wallet.
+        if let Some(wallet) = v["wallet"].as_str() {
+            return Err(format!(
+                "This seed is already the wallet \"{wallet}\" here: forget this QR wallet and add it again to join it."
+            ));
+        }
+        Err(v["error"]
+            .as_str()
+            .unwrap_or("the signer manager refused")
+            .to_string())
     }
     fn sign_progress(&self, job: &str, state: JobState) {
         if !UNLOADING.load(Ordering::SeqCst) {
@@ -153,6 +189,34 @@ fn open_wallets(qr: &QrSigner) {
             eprintln!("qr_signer_module: a wallet's accounts didn't open: {e}");
         }
     }
+    if let Some(statuses) = seed_statuses() {
+        qr.set_seed_statuses(statuses);
+    }
+}
+
+/// What the signer manager says of the wallets of this module's seeds, by seed. A manager that
+/// says nothing of them gives none.
+fn seed_statuses() -> Option<HashMap<String, SeedStatus>> {
+    if UNLOADING.load(Ordering::SeqCst) {
+        return None;
+    }
+    let (tx, rx) = sync_channel(1);
+    wallets::WalletsClient::bind(WALLETS).wallets_async_with_timeout(BUDGET, move |r| {
+        let _ = tx.send(r);
+    });
+    let v: Value = serde_json::from_str(&wait(rx).ok()?).ok()?;
+    let rows = v["wallets"].as_array()?;
+    Some(
+        rows.iter()
+            .filter_map(|w| {
+                let status = SeedStatus {
+                    unlock_key: w["device"].as_bool()?,
+                    way_in: w["wayIn"].as_bool()?,
+                };
+                Some((w["holderSeed"].as_str()?.to_ascii_lowercase(), status))
+            })
+            .collect(),
+    )
 }
 
 /// The key for a seed's document, the seed named as this module names it: its master fingerprint.
@@ -409,11 +473,23 @@ impl QrSignerModule for QrSignerModuleImpl {
             }
             let p = profile::get(&o.profile);
             let name = self.qr.wallet_name(&fingerprint);
-            wallets.push(json!({
+            let mut w = json!({
                 "fingerprint": fingerprint, "profile": p.name, "label": p.label, "name": name
-            }));
+            });
+            if let Some(s) = self.qr.seed_status(&fingerprint) {
+                w["unlockKey"] = s.unlock_key.into();
+                w["wayIn"] = s.way_in.into();
+            }
+            wallets.push(w);
         }
         json!({ "ok": true, "wallets": wallets }).to_string()
+    }
+
+    fn give_unlock_key(&self, seed: String) -> String {
+        match self.qr.give_unlock_key(&seed) {
+            Ok(job) => json!({ "ok": true, "job": job }).to_string(),
+            Err(e) => signer_err(e),
+        }
     }
 
     fn rename_wallet(&self, fingerprint: String, name: String) -> String {

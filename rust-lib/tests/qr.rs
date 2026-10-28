@@ -17,7 +17,9 @@ use logos_signer_interface::{unlock, Account, ErrorCode, Family, JobState, Paylo
 use logos_signer_interface::{Secret, Signer, SignerError, UnlockKey, UnlockKeyRequest};
 use qr_signer_module::emulator::Emulator;
 use qr_signer_module::parts;
-use qr_signer_module::signer::{Events, QrSigner, ScanPoll, ScanRequest, Scanner, Show};
+use qr_signer_module::signer::{
+    Events, QrSigner, ScanPoll, ScanRequest, Scanner, SeedStatus, Show,
+};
 use qr_signer_module::store::Store;
 
 /// Hands the emulator what the window would show, and the camera what the emulator holds up.
@@ -33,16 +35,19 @@ struct InProcess {
     hidden: AtomicBool,
     /// The wallet reads requests and never answers, as a person who walks away.
     mute: AtomicBool,
+    /// Each session's title.
+    titles: Mutex<Vec<String>>,
 }
 
 impl Scanner for InProcess {
     fn start(
         &self,
-        _: &str,
+        title: &str,
         show: Option<Show<'_>>,
         _: bool,
         _: &str,
     ) -> Result<(String, String), String> {
+        self.titles.lock().unwrap().push(title.into());
         let texts = match show {
             // Codes too large for the terminal never reach the wallet.
             Some(s)
@@ -98,9 +103,14 @@ impl Scanner for InProcess {
 /// A seed the signer registered with the manager: its name, its unlock key, the wallet's name.
 type Enrolled = (String, Option<[u8; 33]>, String);
 
-/// Hears the seeds the signer would register with the manager.
+/// Hears the seeds the signer would register with the manager, then the keys given later, and
+/// answers those with a refusal when one is set.
 #[derive(Clone, Default)]
-struct Heard(Arc<Mutex<Vec<Enrolled>>>);
+struct Heard(
+    Arc<Mutex<Vec<Enrolled>>>,
+    Arc<Mutex<Vec<Enrolled>>>,
+    Arc<Mutex<Option<String>>>,
+);
 
 impl Events for Heard {
     fn sign_progress(&self, _: &str, _: JobState) {}
@@ -110,6 +120,16 @@ impl Events for Heard {
             .lock()
             .unwrap()
             .push((seed.into(), unlock_key, name.into()));
+    }
+    fn seed_key_given(&self, seed: &str, unlock_key: [u8; 33], name: &str) -> Result<(), String> {
+        if let Some(refusal) = self.2.lock().unwrap().clone() {
+            return Err(refusal);
+        }
+        self.1
+            .lock()
+            .unwrap()
+            .push((seed.into(), Some(unlock_key), name.into()));
+        Ok(())
     }
 }
 
@@ -128,6 +148,7 @@ fn rig(emu: Emulator, store: Store, patience: Duration) -> Rig {
         shown: Mutex::new(Vec::new()),
         hidden: AtomicBool::new(false),
         mute: AtomicBool::new(false),
+        titles: Mutex::new(Vec::new()),
     });
     let heard = Heard::default();
     let signer = QrSigner::with_patience(scanner.clone(), store, Box::new(heard.clone()), patience);
@@ -248,6 +269,17 @@ fn account(s: &QrSigner, family: Family) -> Account {
 
 fn seed_of(s: &QrSigner) -> String {
     hex::encode(s.offered()[0].fingerprint)
+}
+
+/// A Shell whose wallet didn't answer the add's request for the seed's unlock key, answering again.
+fn added_without_its_key() -> Rig {
+    let r = rig(Emulator::default(), Store::new(), Duration::from_secs(1));
+    r.scanner.mute.store(true, Ordering::SeqCst);
+    let job = r.signer.scan_accounts(all_families()).unwrap();
+    assert_eq!(scanned(&r.signer, &job), "done");
+    assert_eq!(r.signer.add_status(&job).unwrap().unlock_key, Some(false));
+    r.scanner.mute.store(false, Ordering::SeqCst);
+    r
 }
 
 #[test]
@@ -397,6 +429,89 @@ fn a_scan_stops_while_it_asks_for_the_unlock_key() {
     assert_eq!(scanned(&r.signer, &job), "cancelled");
     assert!(r.signer.offered().is_empty(), "nothing kept half added");
     assert!(r.heard.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_shell_added_without_its_key_gives_it_later() {
+    let r = added_without_its_key();
+    let seed = seed_of(&r.signer);
+    let job = r.signer.give_unlock_key(&seed.to_uppercase()).unwrap();
+    assert_eq!(scanned(&r.signer, &job), "done");
+    assert_eq!(r.signer.add_status(&job).unwrap().unlock_key, Some(true));
+    let given = r.heard.1.lock().unwrap().clone();
+    assert_eq!(given.len(), 1);
+    let (s, key, name) = &given[0];
+    assert_eq!(s, &seed);
+    assert_eq!(key.map(hex::encode), Some(mocks_unlock_key(0)));
+    assert_eq!(name, "Keycard Shell (emulated)");
+    assert_eq!(
+        r.scanner.titles.lock().unwrap().last().unwrap(),
+        &format!("Give the unlock key of QR wallet {seed}")
+    );
+}
+
+#[test]
+fn the_managers_refusal_of_a_given_key_is_what_the_person_reads() {
+    let r = added_without_its_key();
+    *r.heard.2.lock().unwrap() = Some("This seed is already the wallet \"Cold\" here".into());
+    let job = r.signer.give_unlock_key(&seed_of(&r.signer)).unwrap();
+    assert_eq!(scanned(&r.signer, &job), "failed");
+    let added = r.signer.add_status(&job).unwrap();
+    assert!(added.error.unwrap().contains("already the wallet \"Cold\""));
+    assert!(r.heard.1.lock().unwrap().is_empty());
+}
+
+#[test]
+fn only_a_shell_it_holds_gives_its_key_later() {
+    let r = rig(keystone(), Store::new(), Duration::from_secs(20));
+    let job = r.signer.scan_accounts(all_families()).unwrap();
+    assert_eq!(scanned(&r.signer, &job), "done");
+    let code = |seed: &str| r.signer.give_unlock_key(seed).unwrap_err().code;
+    assert_eq!(code(&seed_of(&r.signer)), ErrorCode::Unsupported);
+    assert_eq!(code("00000000"), ErrorCode::WrongSeed);
+    assert!(r.scanner.shown.lock().unwrap().is_empty(), "nothing shown");
+}
+
+#[test]
+fn giving_the_key_stops_when_asked_and_frees_the_scanner() {
+    let r = added_without_its_key();
+    r.scanner.mute.store(true, Ordering::SeqCst);
+    let job = r.signer.give_unlock_key(&seed_of(&r.signer)).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(r.signer.cancel_scan(&job));
+    assert_eq!(scanned(&r.signer, &job), "cancelled");
+    assert!(r.heard.1.lock().unwrap().is_empty());
+    r.scanner.mute.store(false, Ordering::SeqCst);
+    let again = r.signer.give_unlock_key(&seed_of(&r.signer)).unwrap();
+    assert_eq!(scanned(&r.signer, &again), "done");
+}
+
+#[test]
+fn the_managers_word_on_each_seed_is_kept_until_it_says_again() {
+    let (s, _) = signer(Emulator::default());
+    scan_all(&s);
+    let seed = seed_of(&s);
+    assert_eq!(s.seed_status(&seed), None, "nothing said yet");
+    let said = SeedStatus {
+        unlock_key: false,
+        way_in: false,
+    };
+    s.set_seed_statuses(HashMap::from([(seed.clone(), said)]));
+    assert_eq!(s.seed_status(&seed), Some(said));
+    s.set_seed_statuses(HashMap::new());
+    assert_eq!(s.seed_status(&seed), None);
+}
+
+#[test]
+fn the_unlock_request_names_the_wallet_to_hold_up() {
+    let (mut s, scanner) = signer(Emulator::default());
+    scan_all(&s);
+    let seed = seed_of(&s);
+    unlock_key(&mut s, &seed, 0).unwrap();
+    assert_eq!(
+        scanner.titles.lock().unwrap().last().unwrap(),
+        &format!("Unlock with your QR wallet {seed}")
+    );
 }
 
 #[test]
