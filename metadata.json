@@ -9,6 +9,9 @@
   "category": "wallet",
   "main": "qr_signer_module_plugin",
   "dependencies": ["qr_scanner_module"],
+  "interface_dependencies": [
+    { "name": "wallets", "input": "logos-signer-interface", "file": "wallets.lidl" }
+  ],
   "include": [],
   "capabilities": [],
   "codegen": {

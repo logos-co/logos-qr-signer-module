@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use logos_signer_interface::json as signer_json;
+use logos_signer_interface::wallets::{read_data_key, DataKey, DataKeyRequest};
 use logos_signer_interface::JobState;
 use serde_json::{json, Value};
 
@@ -24,12 +25,19 @@ pub trait QrSignerModule: Send + Sync + 'static {
     fn sign_status(&self, job: String) -> String;
     fn sign_result(&self, job: String) -> String;
     fn cancel_sign(&self, job: String) -> String;
+    /// A seed's unlock key, for the signer manager alone: `{ seed, index }` → `{ ok, job }`; the
+    /// job waits in `confirm_on_device` while the request shows and its answer is read.
+    fn unlock_key(&self, request_json: String) -> String;
+    fn unlock_key_status(&self, job: String) -> String;
+    /// `{ ok, job, key }`, once: the job forgets it.
+    fn unlock_key_result(&self, job: String) -> String;
+    fn cancel_unlock_key(&self, job: String) -> String;
 
     // ── the QR signer's app ─────────────────────────────────────────────
     /// The wallets it knows by name: `{ ok, profiles: [{ name, label }] }`.
     fn profiles(&self) -> String;
-    /// Read a wallet's account code and offer accounts of these families:
-    /// `{ families, label?, profile? }` → `{ ok, job }`.
+    /// Read a wallet's account code and offer accounts of these families, each with its own name
+    /// or none: `{ families, labels?: { <family>: name }, label?, profile? }` → `{ ok, job }`.
     fn scan_accounts(&self, params_json: String) -> String;
     /// A scan's progress: `{ ok, job, state, accounts, error? }`.
     fn add_status(&self, job: String) -> String;
@@ -63,9 +71,29 @@ static UNLOADING: AtomicBool = AtomicBool::new(false);
 /// How long one call to the scanner may take; a session itself lasts as long as the person needs.
 const BUDGET: Duration = Duration::from_secs(20);
 
+/// The module behind `logos.wallets/1`: the signer manager, bound at runtime, since it depends on
+/// this module and this module can't depend on it.
+const WALLETS: &str = "signer_manager_module";
+
+fn from_manager() -> bool {
+    matches!(logos_rust_sdk::current_caller(), logos_rust_sdk::LogosCaller::Module { name, .. } if name == WALLETS)
+}
+
 struct Emit;
 
 impl Events for Emit {
+    /// The seed goes to the signer manager while its unlock key is at hand, so the person never
+    /// unlocks it a second time. Asked without waiting: without a manager the add stands.
+    fn seed_added(&self, seed: &str, unlock_key: Option<[u8; 33]>, name: &str) {
+        if UNLOADING.load(Ordering::SeqCst) {
+            return;
+        }
+        let body = zeroize::Zeroizing::new(
+            json!({ "seed": seed, "kind": "qr", "unlockKey": unlock_key.map(hex::encode), "name": name })
+                .to_string(),
+        );
+        wallets::WalletsClient::bind(WALLETS).enroll_seed_async(&body, |_| {});
+    }
     fn sign_progress(&self, job: &str, state: JobState) {
         if !UNLOADING.load(Ordering::SeqCst) {
             emit_sign_progress(job, state.as_str());
@@ -76,6 +104,70 @@ impl Events for Emit {
             emit_signer_accounts_changed(count as i64);
         }
     }
+}
+
+/// A seed's accounts open with this module's key for it, which the signer manager gives once the
+/// person unlocks the wallet in the Signer app, and close when it locks. Asked from threads of their
+/// own, never while answering the manager, which would wait on itself.
+fn watch_wallets(qr: QrSigner) {
+    let mut client = wallets::WalletsClient::bind(WALLETS);
+    let changed = client.on_wallets_changed();
+    let locked = client.on_wallets_locked();
+    let q = qr.clone();
+    std::thread::spawn(move || {
+        open_wallets(&q);
+        if let Ok(sub) = changed {
+            for _ in sub {
+                open_wallets(&q);
+            }
+        }
+    });
+    if let Ok(sub) = locked {
+        std::thread::spawn(move || {
+            for _ in sub {
+                qr.lock_seeds();
+                // Only some may have locked.
+                open_wallets(&qr);
+            }
+        });
+    }
+}
+
+/// Every closed seed's key; a locked one answers `locked` and stays closed.
+fn open_wallets(qr: &QrSigner) {
+    for (seed, sealed_under) in qr.closed_seeds() {
+        if UNLOADING.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(current) = data_key(&seed, None) else {
+            continue;
+        };
+        let box_key = match sealed_under {
+            Some(g) if g != current.generation => match data_key(&seed, Some(g)) {
+                Some(k) => k,
+                None => continue,
+            },
+            _ => current.clone(),
+        };
+        if let Err(e) = qr.open_seed(&seed, &box_key, &current) {
+            eprintln!("qr_signer_module: a wallet's accounts didn't open: {e}");
+        }
+    }
+}
+
+/// The key for a seed's document, the seed named as this module names it: its master fingerprint.
+fn data_key(seed: &str, generation: Option<u32>) -> Option<DataKey> {
+    let body = serde_json::to_string(&DataKeyRequest {
+        seed: seed.to_string(),
+        scope: "accounts".into(),
+        generation,
+    })
+    .ok()?;
+    let (tx, rx) = sync_channel(1);
+    wallets::WalletsClient::bind(WALLETS).data_key_async_with_timeout(&body, BUDGET, move |r| {
+        let _ = tx.send(r);
+    });
+    read_data_key(&wait(rx).ok()?).ok()
 }
 
 fn wait<T>(rx: Receiver<Result<T, logos_rust_sdk::LogosError>>) -> Result<T, String> {
@@ -225,6 +317,34 @@ impl QrSignerModule for QrSignerModuleImpl {
         signer_json::cancel_sign(&mut self.qr.clone(), &job)
     }
 
+    fn unlock_key(&self, request_json: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::unlock_key(&mut self.qr.clone(), &request_json)
+    }
+
+    fn unlock_key_status(&self, job: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::unlock_key_status(&mut self.qr.clone(), &job)
+    }
+
+    fn unlock_key_result(&self, job: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::unlock_key_result(&mut self.qr.clone(), &job)
+    }
+
+    fn cancel_unlock_key(&self, job: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::cancel_unlock_key(&mut self.qr.clone(), &job)
+    }
+
     fn profiles(&self) -> String {
         let profiles: Vec<Value> = profile::ALL
             .iter()
@@ -304,9 +424,16 @@ impl QrSignerModule for QrSignerModuleImpl {
     }
 
     fn on_context_ready(&self, ctx: &RustModuleContext) {
-        // The accounts offered live in the module's own directory.
+        // The accounts offered live in the module's own directory, each seed's sealed until the
+        // signer manager gives its key.
         match Store::open(&ctx.instance_persistence_path) {
-            Ok(store) => self.qr.set_store(store),
+            Ok(store) => {
+                self.qr.set_store(store);
+                // Off this callback: subscribing waits for the manager's connection in a nested
+                // event loop, which would dispatch other calls inside it.
+                let qr = self.qr.clone();
+                std::thread::spawn(move || watch_wallets(qr));
+            }
             Err(e) => eprintln!("qr_signer_module: {}: {e}", ctx.instance_persistence_path),
         }
     }

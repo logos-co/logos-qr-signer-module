@@ -1294,6 +1294,23 @@
         "type": "github"
       }
     },
+    "logos-signer-interface": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792699186,
+        "narHash": "sha256-Ln9UREet1DALdbxZnBy1osIEXV9/MlQZusR/LV5Bgyk=",
+        "owner": "logos-co",
+        "repo": "logos-signer-interface",
+        "rev": "832fb948ef8bb1efd8e08a95eac483b96f70a567",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-signer-interface",
+        "rev": "832fb948ef8bb1efd8e08a95eac483b96f70a567",
+        "type": "github"
+      }
+    },
     "logos-test-framework": {
       "inputs": {
         "logos-cpp-sdk": [
@@ -2136,6 +2153,7 @@
     "root": {
       "inputs": {
         "logos-module-builder": "logos-module-builder",
+        "logos-signer-interface": "logos-signer-interface",
         "qr_scanner_module": "qr_scanner_module"
       }
     },

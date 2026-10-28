@@ -109,16 +109,34 @@ sections:
         run: |
           ./logos/bin/logosctl --config-dir ./session call qr_signer_module scan_accounts '{"families":["evm","bitcoin","bitcoin_taproot"]}' > add.json
           job=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])["job"])' add.json)
-          for i in $(seq 1 60); do ./logos/bin/logosctl --config-dir ./session call qr_signer_module add_status "$job" > added.json; grep -Eq 'state.....(done|failed)' added.json && break; sleep 0.5; done
+          for i in $(seq 1 120); do ./logos/bin/logosctl --config-dir ./session call qr_signer_module add_status "$job" > added.json; grep -Eq 'state.....(done|failed)' added.json && break; sleep 0.5; done
           cat added.json
         code_block: |
           logosctl call qr_signer_module scan_accounts '{"families":["evm","bitcoin","bitcoin_taproot"]}'
           logosctl call qr_signer_module add_status <job>     # done, once the code is read
         expect_contains:
           - '\"state\":\"done\"'
+          - '\"unlockKey\":true'
           - "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
           - "-84-1-0"
           - "-86-1-0"
+      - title: "Each account names its seed, and only the manager may ask for its unlock key"
+        text: |
+          Adding a Keycard Shell's accounts also asked for the seed's unlock key: one more message to sign,
+          at `m/1280263247'/0'`, which the emulated wallet answered. The seed is its master fingerprint.
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call qr_signer_module signer_info
+          ./logos/bin/logosctl --config-dir ./session call qr_signer_module signer_accounts > seeds.json
+          seed=$(python3 -c 'import json,sys; a=json.loads(json.load(open(sys.argv[1]))["result"])["accounts"]; s={x["seed"] for x in a}; assert len(s)==1 and all(x["key"].startswith("btc_") for x in a if x["family"]!="evm"), a; print(s.pop())' seeds.json)
+          echo "one seed, $seed"
+          ./logos/bin/logosctl --config-dir ./session call qr_signer_module unlock_key "{\"seed\":\"$seed\",\"index\":0}"
+        code_block: |
+          logosctl call qr_signer_module signer_info                       # "unlockKey": true
+          logosctl call qr_signer_module unlock_key '{"seed":"<seed>","index":0}'   # refused: the CLI
+        expect_contains:
+          - '\"unlockKey\":true'
+          - "one seed, "
+          - "not authorized"
       - title: "The manager lists them under the QR signer"
         run: |
           ./logos/bin/logosctl --config-dir ./session call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":["qr_signer_module"]}'

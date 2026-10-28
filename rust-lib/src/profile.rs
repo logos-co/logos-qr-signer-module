@@ -15,10 +15,13 @@ pub struct Profile {
     pub max_outputs: usize,
     /// The largest EVM chain id its decoder takes.
     pub max_chain_id: u64,
+    /// It signs a message at the unlock keys' purpose, so adding it takes its seed's unlock key.
+    /// Any other is added without one: its wallet then unlocks by a password.
+    pub unlocks_by_key: bool,
 }
 
 /// The Keycard Shell, firmware 1.4.0: codes up to version 25, PSBTs of at most 40 inputs and 40
-/// outputs, chain ids that fit an int32.
+/// outputs, chain ids that fit an int32. It signs at `m/1280263247'` (measured).
 pub const KEYCARD_SHELL: Profile = Profile {
     name: "keycard_shell",
     label: "Keycard Shell",
@@ -28,6 +31,7 @@ pub const KEYCARD_SHELL: Profile = Profile {
     max_inputs: 40,
     max_outputs: 40,
     max_chain_id: i32::MAX as u64,
+    unlocks_by_key: true,
 };
 
 /// Any other BC-UR wallet: smaller, slower codes most cameras read.
@@ -40,6 +44,7 @@ pub const GENERIC: Profile = Profile {
     max_inputs: usize::MAX,
     max_outputs: usize::MAX,
     max_chain_id: u64::MAX,
+    unlocks_by_key: false,
 };
 
 pub const ALL: [Profile; 2] = [KEYCARD_SHELL, GENERIC];
