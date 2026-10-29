@@ -56,14 +56,24 @@ Shell's card refuses them.
   })` through `logos.wallets/1` (`wallets.lidl`), bound to `signer_manager_module` at runtime and asked
   without waiting. `add_status` says `step: unlock_key` meanwhile, and `unlockKey: true` once done. A
   wallet that doesn't answer still adds (`unlockKey: false`), and so does a `generic` one, which is never
-  asked: the seed is registered without a key, and its wallet unlocks by a password set in the Signer app.
-  Cancelling the scan during that request cancels the add.
+  asked: the seed is registered without a key, and its wallet has no way in until a password is set for
+  it in the Signer app; QR Wallets says so. Cancelling the scan during that request cancels the add.
+- **Later**, `give_unlock_key(seed)` asks a `keycard_shell` wallet added without its key for it: the same
+  request, in a session titled "Give the unlock key of QR wallet <fingerprint>", then `enroll_seed` again
+  with the key, from the job's thread, waiting for the answer. It runs as an add does: `add_status` follows
+  it, `cancel_scan` stops it, and it ends `done` once the manager takes the key, or `failed` with what the
+  manager said. When the key is already another wallet's (the same Shell added over USB), the person reads
+  that it is, and that forgetting this QR wallet and adding it again joins that wallet. A `generic` wallet
+  is `unsupported`.
 - **`unlock_key`** (`{ seed, index }`, the signer manager alone) returns a job in `confirm_on_device`
   while the request shows and its answer is read, in a scanner session titled "Unlock with your QR
-  wallet", so whichever app draws signing sessions draws it too. `unlock_key_result` gives the key once.
+  wallet <fingerprint>", the fingerprint QR Wallets shows, so whichever app draws signing sessions draws
+  it too and the person knows which wallet to hold up. `unlock_key_result` gives the key once.
   A seed no account comes from is `wrong_seed`; a locked wallet's seed is known, though its accounts
-  aren't listed, and its request then takes the generic profile's sizes, since its profile is sealed. A QR wallet can't be asked which seed it holds: another
-  wallet's answer gives another key, which the manager finds unwraps nothing.
+  aren't listed, and its request then takes the generic profile's sizes, since its profile is sealed.
+- A QR wallet can't be asked which seed it holds. A wallet that reads the request's fingerprint refuses
+  another seed's request itself; any other answers with another seed's key, which the manager refuses
+  (`wrong_seed`) before it unwraps anything.
 - Anyone who photographs the wallet's answer can recover that seed's key at that index; the manager then
   moves the seed to its next index.
 
@@ -100,7 +110,8 @@ For the app:
 | `cancel_scan` | `job` | `{ ok, cancelled }`, whether the scan was still running |
 | `remove_account` | `id` | `{ ok, removed }`. Nothing on the wallet changes |
 | `rename_account` | `id, label` | `{ ok, renamed }`. The name apps see, up to 80 characters; blank clears it |
-| `wallets` | | `{ ok, wallets: [{ fingerprint, profile, label, name }] }`: each wallet accounts came from, by master fingerprint, the profile it follows and the name given to it |
+| `wallets` | | `{ ok, wallets: [{ fingerprint, profile, label, name, unlockKey?, wayIn? }] }`: each wallet accounts came from, by master fingerprint, the profile it follows and the name given to it. Once the signer manager says, `unlockKey` is whether its wallet there has the seed's unlock key and `wayIn` whether any way in opens it after a restart |
+| `give_unlock_key` | `seed` | `{ ok, job }`. A Keycard Shell added without its seed's unlock key gives it now; `add_status` and `cancel_scan` take the job |
 | `rename_wallet` | `fingerprint, name` | `{ ok, renamed }`. Names a wallet some account came from, up to 80 characters; blank clears it. The name goes with the wallet's last account |
 
 Accounts are kept in `accounts.sealed.json` in the module's own directory, readable by its owner alone
@@ -114,6 +125,10 @@ through `logos.wallets/1`, and is read only while the seed is unlocked:
   registers a seed it adds, from threads of its own too: a call's first connection to the manager waits
   in a nested event loop, which would dispatch other calls inside it. `wallets_locked` closes
   every seed and asks again, as only some may have locked.
+- Each time, it also reads the manager's `wallets()`, which tells a holder, for each wallet it holds, its
+  own name for the seed (`holderSeed`), whether the wallet has the seed's unlock key (`device`) and
+  whether it has a way in (`wayIn`). A change is announced as `signer_accounts_changed`. A manager that
+  doesn't say leaves both unknown, and QR Wallets then says only what the add saw.
 - A locked seed's accounts aren't listed. An add while its seed is sealed and locked waits in memory and
   joins the seed's document when it unlocks; a Keycard Shell's add unlocks it itself, since registering
   the seed with its unlock key does.
@@ -148,8 +163,9 @@ loop on the module's main thread. Before the module unloads, waiting calls are a
   BIP84's and BIP86's xpubs, the v forms, and end to end against `qr-device-emulator` with the scanner in
   process: the unlock key equal to the mock signer's for the same seed at index 0 and 1, the seed
   registered at add with it or without it, the guards, accounts sealed per seed in a 0600 file and read
-  only while the seed is unlocked, an add while locked joining at unlock, and the signer interface's
-  conformance suite for both profiles.
+  only while the seed is unlocked, an add while locked joining at unlock, a Shell added without its key
+  giving it later (or the manager's refusal, or a cancel), the session titles naming the wallet, and the
+  signer interface's conformance suite for both profiles.
 - **The emulator** (`nix build .#emulator`) is a QR wallet in software behind the QR helper's fake mode: it
   reads the frames the helper would show, signs with the signer interface's mock keys, and holds up its
   answer as pictures of QR codes. Asked to scan with nothing shown, it shows its accounts; a message at the

@@ -93,6 +93,25 @@ pub trait Events: Send + Sync {
     /// Accounts of a seed were added, with its unlock key at index 0 when the wallet gave it: the
     /// glue registers the seed with the signer manager.
     fn seed_added(&self, _seed: &str, _unlock_key: Option<[u8; 33]>, _name: &str) {}
+    /// A seed added without its unlock key gives it now: the glue registers the key with the signer
+    /// manager and waits for its answer.
+    fn seed_key_given(
+        &self,
+        _seed: &str,
+        _unlock_key: [u8; 33],
+        _name: &str,
+    ) -> std::result::Result<(), String> {
+        Err("there is no signer manager to give it to".into())
+    }
+}
+
+/// What the signer manager says of a seed's wallet: whether it has the seed's unlock key, and
+/// whether any way in opens it after a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeedStatus {
+    pub unlock_key: bool,
+    pub way_in: bool,
 }
 
 /// `scan_accounts`'s parameters.
@@ -168,8 +187,8 @@ pub struct Added {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step: Option<&'static str>,
     pub accounts: Vec<Account>,
-    /// Once done: whether the wallet gave its seed's unlock key. Without it the wallet unlocks by
-    /// a password.
+    /// Once done: whether the wallet gave its seed's unlock key. Without it, its wallet needs a
+    /// password in the Signer app, or a Shell gives the key later (`give_unlock_key`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unlock_key: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -412,6 +431,7 @@ struct Shared {
     /// Unlock-key jobs: read once, by the manager only, and announced nowhere.
     keys: Mutex<KeyJobs>,
     adds: Mutex<HashMap<String, Added>>,
+    statuses: Mutex<HashMap<String, SeedStatus>>,
     events: Box<dyn Events>,
     seq: AtomicU64,
     busy: AtomicBool,
@@ -458,6 +478,7 @@ impl QrSigner {
                 jobs: Mutex::new(JobTable::new()),
                 keys: Mutex::new(KeyJobs::new()),
                 adds: Mutex::new(HashMap::new()),
+                statuses: Mutex::new(HashMap::new()),
                 events,
                 seq: AtomicU64::new(0),
                 busy: AtomicBool::new(false),
@@ -560,17 +581,99 @@ impl QrSigner {
                 Err(_) if stop.load(Ordering::SeqCst) => Added::ended("cancelled", None),
                 Err(e) => Added::ended("failed", Some(e.message)),
             };
-            lock(&shared.adds).insert(job.clone(), added);
-            // The outcome first, then the scan, then the scanner: whoever replaces it finds all said.
-            {
-                let mut scan = lock(&shared.scan);
-                if scan.as_ref().is_some_and(|(id, _)| *id == job) {
-                    *scan = None;
-                }
-            }
-            shared.busy.store(false, Ordering::SeqCst);
+            shared.settle(&job, added);
         });
         Ok(id)
+    }
+
+    /// Ask a Shell added without its seed's unlock key for it, and give it to the signer manager:
+    /// one request and answer, followed with `add_status` and stopped with `cancel_scan`.
+    pub fn give_unlock_key(&self, seed: &str) -> Result<String> {
+        let seed = seed.trim().to_ascii_lowercase();
+        let (fingerprint, p, name) = {
+            let store = lock(&self.shared.store);
+            let o = store
+                .list()
+                .iter()
+                .find(|o| hex::encode(o.fingerprint) == seed)
+                .ok_or_else(|| err(ErrorCode::WrongSeed, "no QR account comes from this seed"))?;
+            let p = profile::get(&o.profile);
+            let name = enrol_name(&store, &seed, o.device.as_deref(), &p);
+            (o.fingerprint, p, name)
+        };
+        if !p.unlocks_by_key {
+            return Err(err(
+                ErrorCode::Unsupported,
+                "this kind of QR wallet gives no unlock key: its wallet unlocks by a password",
+            ));
+        }
+        if self.shared.busy.swap(true, Ordering::SeqCst) {
+            return Err(err(
+                ErrorCode::Busy,
+                "the QR signer is already reading a code",
+            ));
+        }
+        let id = format!("key_{}", self.shared.seq.fetch_add(1, Ordering::SeqCst) + 1);
+        lock(&self.shared.adds).insert(
+            id.clone(),
+            Added {
+                state: "scanning",
+                step: Some("unlock_key"),
+                accounts: Vec::new(),
+                unlock_key: None,
+                error: None,
+            },
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        *lock(&self.shared.scan) = Some((id.clone(), stop.clone()));
+        let shared = self.shared.clone();
+        let job = id.clone();
+        std::thread::spawn(move || {
+            let stopped = || stop.load(Ordering::SeqCst);
+            let title = format!("Give the unlock key of QR wallet {seed}");
+            let given = shared
+                .unlock_key_from_wallet(&title, fingerprint, &p, 0, &stopped)
+                .and_then(|key| {
+                    let key = Zeroizing::new(key);
+                    shared
+                        .events
+                        .seed_key_given(&seed, *key, &name)
+                        .map_err(|e| err(ErrorCode::Unavailable, e))
+                });
+            let added = match given {
+                Ok(()) => Added {
+                    state: "done",
+                    step: None,
+                    accounts: Vec::new(),
+                    unlock_key: Some(true),
+                    error: None,
+                },
+                Err(_) if stopped() => Added::ended("cancelled", None),
+                Err(e) => Added::ended("failed", Some(e.message)),
+            };
+            shared.settle(&job, added);
+        });
+        Ok(id)
+    }
+
+    /// The signer manager's word on each seed's wallet, by seed, replacing what it said before;
+    /// apps hear of a change as their accounts changing.
+    pub fn set_seed_statuses(&self, statuses: HashMap<String, SeedStatus>) {
+        let changed = {
+            let mut now = lock(&self.shared.statuses);
+            let changed = *now != statuses;
+            *now = statuses;
+            changed
+        };
+        if changed {
+            let count = lock(&self.shared.store).list().len();
+            self.shared.events.accounts_changed(count);
+        }
+    }
+
+    /// What the signer manager last said of a seed's wallet, if it said anything.
+    pub fn seed_status(&self, seed: &str) -> Option<SeedStatus> {
+        lock(&self.shared.statuses).get(seed).copied()
     }
 
     /// Stop an account scan. Whether it was still running.
@@ -686,7 +789,30 @@ impl QrSigner {
     }
 }
 
+/// The name a seed is registered under: the wallet's own, else the device its code names, else the
+/// profile's. Never an account's.
+fn enrol_name(store: &Store, seed: &str, device: Option<&str>, p: &Profile) -> String {
+    store
+        .wallet_name(seed)
+        .filter(|n| !n.trim().is_empty())
+        .or(device)
+        .unwrap_or(p.label)
+        .to_string()
+}
+
 impl Shared {
+    /// A scan's outcome first, then the scan, then the scanner: whoever replaces it finds all said.
+    fn settle(&self, job: &str, added: Added) {
+        lock(&self.adds).insert(job.to_string(), added);
+        {
+            let mut scan = lock(&self.scan);
+            if scan.as_ref().is_some_and(|(id, _)| id == job) {
+                *scan = None;
+            }
+        }
+        self.busy.store(false, Ordering::SeqCst);
+    }
+
     /// Run one scanner session until the wallet's answer is complete.
     fn session(
         &self,
@@ -839,13 +965,7 @@ impl Shared {
             store
                 .put(made.clone())
                 .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
-            // The wallet's own name, never an account's.
-            let name = store
-                .wallet_name(&seed)
-                .map(str::to_string)
-                .filter(|n| !n.trim().is_empty())
-                .or_else(|| found.device.clone())
-                .unwrap_or_else(|| p.label.to_string());
+            let name = enrol_name(&store, &seed, found.device.as_deref(), &p);
             (store.list().len(), name)
         };
         self.events.accounts_changed(count);
@@ -1091,9 +1211,10 @@ impl Signer for QrSigner {
                     .status(&id)
                     .map_or(true, |s| s.state.is_final())
             };
+            // The fingerprint QR Wallets shows, so the person knows which wallet to hold up.
             let outcome = shared
                 .unlock_key_from_wallet(
-                    "Unlock with your QR wallet",
+                    &format!("Unlock with your QR wallet {seed}"),
                     fingerprint,
                     &p,
                     request.index,
