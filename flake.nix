@@ -11,7 +11,7 @@
     # logos.wallets/1 (wallets.lidl): the signer manager, bound at runtime, since it depends on
     # this module and this module can't depend on it.
     logos-signer-interface = {
-      url = "github:logos-co/logos-signer-interface/832fb948ef8bb1efd8e08a95eac483b96f70a567";
+      url = "github:logos-co/logos-signer-interface/7bc209839253b81a051a4e4d82c344cbb121d324";
       flake = false;
     };
   };
