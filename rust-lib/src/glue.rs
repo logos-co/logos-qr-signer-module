@@ -10,7 +10,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use logos_signer_interface::json as signer_json;
-use logos_signer_interface::wallets::{read_data_key, DataKey, DataKeyRequest};
+use logos_signer_interface::wallets::{
+    name_steps, read_data_key, read_wallets, DataKey, DataKeyRequest, NameSeed, NameStep,
+};
 use logos_signer_interface::JobState;
 use serde_json::{json, Value};
 
@@ -130,6 +132,9 @@ impl Events for Emit {
             .unwrap_or("the signer manager refused")
             .to_string())
     }
+    fn seed_named(&self, seed: &str, name: &str) {
+        send_name(seed, name);
+    }
     fn sign_progress(&self, job: &str, state: JobState) {
         if !UNLOADING.load(Ordering::SeqCst) {
             emit_sign_progress(job, state.as_str());
@@ -189,14 +194,16 @@ fn open_wallets(qr: &QrSigner) {
             eprintln!("qr_signer_module: a wallet's accounts didn't open: {e}");
         }
     }
-    if let Some(statuses) = seed_statuses() {
-        qr.set_seed_statuses(statuses);
+    if let Some(raw) = manager_wallets() {
+        if let Some(statuses) = seed_statuses(&raw) {
+            qr.set_seed_statuses(statuses);
+        }
+        sync_names(qr, &raw);
     }
 }
 
-/// What the signer manager says of the wallets of this module's seeds, by seed. A manager that
-/// says nothing of them gives none.
-fn seed_statuses() -> Option<HashMap<String, SeedStatus>> {
+/// `wallets()` as the signer manager answers it, when it answers.
+fn manager_wallets() -> Option<String> {
     if UNLOADING.load(Ordering::SeqCst) {
         return None;
     }
@@ -204,7 +211,56 @@ fn seed_statuses() -> Option<HashMap<String, SeedStatus>> {
     wallets::WalletsClient::bind(WALLETS).wallets_async_with_timeout(BUDGET, move |r| {
         let _ = tx.send(r);
     });
-    let v: Value = serde_json::from_str(&wait(rx).ok()?).ok()?;
+    wait(rx).ok()
+}
+
+/// Seeds whose name went to the manager this run: each goes once.
+static SENT_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// One name per wallet: take the name the person gave in any app, and send one given here while
+/// the wallet has none.
+fn sync_names(qr: &QrSigner, raw: &str) {
+    let Ok(listed) = read_wallets(raw) else {
+        return;
+    };
+    for step in name_steps(&listed, |fp| qr.wallet_name(&fp.to_ascii_lowercase())) {
+        match step {
+            NameStep::Take { seed, name } => {
+                if let Err(e) = qr.take_wallet_name(&seed, &name) {
+                    eprintln!(
+                        "qr_signer_module: a wallet's name didn't apply: {}",
+                        e.message
+                    );
+                }
+            }
+            NameStep::Send { seed, name } => {
+                let mut sent = SENT_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+                if !sent.contains(&seed) {
+                    sent.push(seed.clone());
+                    send_name(&seed, &name);
+                }
+            }
+        }
+    }
+}
+
+fn send_name(seed: &str, name: &str) {
+    if UNLOADING.load(Ordering::SeqCst) {
+        return;
+    }
+    let body = NameSeed {
+        seed: seed.into(),
+        name: name.into(),
+    };
+    if let Ok(body) = serde_json::to_string(&body) {
+        wallets::WalletsClient::bind(WALLETS).name_seed_async(&body, |_| {});
+    }
+}
+
+/// What the signer manager says of the wallets of this module's seeds, by seed. A manager that
+/// says nothing of them gives none.
+fn seed_statuses(raw: &str) -> Option<HashMap<String, SeedStatus>> {
+    let v: Value = serde_json::from_str(raw).ok()?;
     let rows = v["wallets"].as_array()?;
     Some(
         rows.iter()

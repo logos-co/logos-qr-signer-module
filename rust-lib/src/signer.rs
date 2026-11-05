@@ -103,6 +103,8 @@ pub trait Events: Send + Sync {
     ) -> std::result::Result<(), String> {
         Err("there is no signer manager to give it to".into())
     }
+    /// The person renamed a seed's wallet here: the glue gives the name to the signer manager.
+    fn seed_named(&self, _seed: &str, _name: &str) {}
 }
 
 /// What the signer manager says of a seed's wallet: whether it has the seed's unlock key, and
@@ -728,7 +730,17 @@ impl QrSigner {
     }
 
     /// Name a wallet by its master fingerprint, for apps; a blank name clears it. Whether it changed.
+    /// A new name goes on to the signer manager.
     pub fn rename_wallet(&self, fingerprint: &str, name: &str) -> Result<bool> {
+        self.name_wallet(fingerprint, name, true)
+    }
+
+    /// A wallet's name, kept here without sending it on: the person may have given it in another app.
+    pub fn take_wallet_name(&self, fingerprint: &str, name: &str) -> Result<bool> {
+        self.name_wallet(fingerprint, name, false)
+    }
+
+    fn name_wallet(&self, fingerprint: &str, name: &str, send: bool) -> Result<bool> {
         let fingerprint = fingerprint.trim().to_ascii_lowercase();
         let name = Some(name.trim()).filter(|n| !n.is_empty());
         if name.as_ref().is_some_and(|n| n.chars().count() > 80) {
@@ -750,6 +762,9 @@ impl QrSigner {
         };
         if renamed {
             self.shared.events.accounts_changed(count);
+            if let Some(name) = name.filter(|_| send) {
+                self.shared.events.seed_named(&fingerprint, name);
+            }
         }
         Ok(renamed)
     }

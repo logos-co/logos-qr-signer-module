@@ -65,6 +65,12 @@ Shell's card refuses them.
   manager said. When the key is already another wallet's (the same Shell added over USB), the person reads
   that it is, and that forgetting this QR wallet and adding it again joins that wallet. A `generic` wallet
   is `unsupported`.
+- **One name per wallet.** The manager keeps the name every app shows.
+  - A new name given with `rename_wallet` goes on with `name_seed({ seed: fingerprint, name })`, asked
+    without waiting. A cleared name sends nothing.
+  - Each time the module reads `wallets()` (at start, and on `wallets_changed` and `wallets_locked`), it
+    takes the name of each wallet it holds that is `named`, without sending it back, and sends its own
+    name for one not named yet, once a run. The manager allows 64 characters.
 - **`unlock_key`** (`{ seed, index }`, the signer manager alone) returns a job in `confirm_on_device`
   while the request shows and its answer is read, in a scanner session titled "Unlock with your QR
   wallet <fingerprint>", the fingerprint QR Wallets shows, so whichever app draws signing sessions draws
@@ -112,7 +118,7 @@ For the app:
 | `rename_account` | `id, label` | `{ ok, renamed }`. The name apps see, up to 80 characters; blank clears it |
 | `wallets` | | `{ ok, wallets: [{ fingerprint, profile, label, name, unlockKey?, wayIn? }] }`: each wallet accounts came from, by master fingerprint, the profile it follows and the name given to it. Once the signer manager says, `unlockKey` is whether its wallet there has the seed's unlock key and `wayIn` whether any way in opens it after a restart |
 | `give_unlock_key` | `seed` | `{ ok, job }`. A Keycard Shell added without its seed's unlock key gives it now; `add_status` and `cancel_scan` take the job |
-| `rename_wallet` | `fingerprint, name` | `{ ok, renamed }`. Names a wallet some account came from, up to 80 characters; blank clears it. The name goes with the wallet's last account |
+| `rename_wallet` | `fingerprint, name` | `{ ok, renamed }`. Names a wallet some account came from, up to 80 characters; blank clears it. The name goes with the wallet's last account, and to the signer manager (see "One name per wallet") |
 
 Accounts are kept in `accounts.sealed.json` in the module's own directory, readable by its owner alone
 (0600), one document per seed (the signer interface's `sealed::SealedDocs`): its accounts, with the
