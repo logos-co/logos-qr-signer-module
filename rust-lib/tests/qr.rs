@@ -841,7 +841,10 @@ fn a_wallet_renamed_here_is_sent_on_and_a_name_taken_from_elsewhere_is_not() {
     let r = rig(Emulator::default(), Store::new(), Duration::from_secs(20));
     scan_all(&r.signer);
     let fp = hex::encode(r.signer.offered()[0].fingerprint);
-    assert!(r.signer.rename_wallet(&fp.to_uppercase(), " Cold ").unwrap());
+    assert!(r
+        .signer
+        .rename_wallet(&fp.to_uppercase(), " Cold ")
+        .unwrap());
     assert!(r.signer.take_wallet_name(&fp, "Savings").unwrap());
     assert_eq!(r.signer.wallet_name(&fp).as_deref(), Some("Savings"));
     // Cleared, it has no name of the person's to send.

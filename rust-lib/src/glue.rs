@@ -227,7 +227,10 @@ fn sync_names(qr: &QrSigner, raw: &str) {
         match step {
             NameStep::Take { seed, name } => {
                 if let Err(e) = qr.take_wallet_name(&seed, &name) {
-                    eprintln!("qr_signer_module: a wallet's name didn't apply: {}", e.message);
+                    eprintln!(
+                        "qr_signer_module: a wallet's name didn't apply: {}",
+                        e.message
+                    );
                 }
             }
             NameStep::Send { seed, name } => {
@@ -245,7 +248,10 @@ fn send_name(seed: &str, name: &str) {
     if UNLOADING.load(Ordering::SeqCst) {
         return;
     }
-    let body = NameSeed { seed: seed.into(), name: name.into() };
+    let body = NameSeed {
+        seed: seed.into(),
+        name: name.into(),
+    };
     if let Ok(body) = serde_json::to_string(&body) {
         wallets::WalletsClient::bind(WALLETS).name_seed_async(&body, |_| {});
     }
