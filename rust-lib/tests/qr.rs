@@ -110,6 +110,7 @@ struct Heard(
     Arc<Mutex<Vec<Enrolled>>>,
     Arc<Mutex<Vec<Enrolled>>>,
     Arc<Mutex<Option<String>>>,
+    Arc<Mutex<Vec<(String, String)>>>,
 );
 
 impl Events for Heard {
@@ -130,6 +131,9 @@ impl Events for Heard {
             .unwrap()
             .push((seed.into(), Some(unlock_key), name.into()));
         Ok(())
+    }
+    fn seed_named(&self, seed: &str, name: &str) {
+        self.3.lock().unwrap().push((seed.into(), name.into()));
     }
 }
 
@@ -830,6 +834,19 @@ fn accounts_are_named_and_unnamed() {
         s.rename_account("nope", "x").unwrap_err().code,
         ErrorCode::UnknownAccount
     );
+}
+
+#[test]
+fn a_wallet_renamed_here_is_sent_on_and_a_name_taken_from_elsewhere_is_not() {
+    let r = rig(Emulator::default(), Store::new(), Duration::from_secs(20));
+    scan_all(&r.signer);
+    let fp = hex::encode(r.signer.offered()[0].fingerprint);
+    assert!(r.signer.rename_wallet(&fp.to_uppercase(), " Cold ").unwrap());
+    assert!(r.signer.take_wallet_name(&fp, "Savings").unwrap());
+    assert_eq!(r.signer.wallet_name(&fp).as_deref(), Some("Savings"));
+    // Cleared, it has no name of the person's to send.
+    assert!(r.signer.rename_wallet(&fp, "").unwrap());
+    assert_eq!(*r.heard.3.lock().unwrap(), vec![(fp, "Cold".to_string())]);
 }
 
 #[test]
