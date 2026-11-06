@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use bitcoin::secp256k1::ecdsa;
 use bitcoin::Psbt;
 use logos_signer_interface::jobs::{JobTable, KeyJobs};
-use logos_signer_interface::wallets::DataKey;
+use logos_signer_interface::wallets::{DataKey, Wallet};
 use logos_signer_interface::{
     psbt as shared, unlock, verify, Account, Collects, ErrorCode, Family, JobState, JobStatus,
     Payload, RequestKind, Result, Secret, SignRequest, Signature, Signer, SignerError, SignerInfo,
@@ -105,6 +105,8 @@ pub trait Events: Send + Sync {
     }
     /// The person renamed a seed's wallet here: the glue gives the name to the signer manager.
     fn seed_named(&self, _seed: &str, _name: &str) {}
+    /// A seed's wallet went with its last account: the glue tells the signer manager.
+    fn seed_forgotten(&self, _seed: &str) {}
 }
 
 /// What the signer manager says of a seed's wallet: whether it has the seed's unlock key, and
@@ -693,18 +695,31 @@ impl QrSigner {
         lock(&self.shared.adds).get(job).cloned()
     }
 
+    /// Stop offering an account. Whether it went; a wallet whose last account it was goes too, in
+    /// the signer manager as well.
     pub fn remove_account(&self, id: &str) -> Result<bool> {
-        let (removed, count) = {
+        let (removed, count, gone) = {
             let mut store = lock(&self.shared.store);
+            let seed = store.find(id).map(crate::store::seed_of);
             let removed = store
                 .remove(id)
                 .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
-            (removed, store.list().len())
+            let gone = seed.filter(|s| removed && !store.knows(s));
+            (removed, store.list().len(), gone)
         };
         if removed {
             self.shared.events.accounts_changed(count);
         }
+        if let Some(seed) = gone {
+            self.shared.events.seed_forgotten(&seed);
+        }
         Ok(removed)
+    }
+
+    /// The wallets the signer manager still lists this module holding, forgotten here before it
+    /// could hear of it: each one to forget there too.
+    pub fn stale_wallets(&self, listed: &[Wallet]) -> Vec<String> {
+        lock(&self.shared.store).stale(listed)
     }
 
     /// Name an account for apps; a blank name clears it. Whether it changed.

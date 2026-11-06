@@ -71,6 +71,15 @@ Shell's card refuses them.
   - Each time the module reads `wallets()` (at start, and on `wallets_changed` and `wallets_locked`), it
     takes the name of each wallet it holds that is `named`, without sending it back, and sends its own
     name for one not named yet, once a run. The manager allows 64 characters.
+- **A wallet goes from the signer manager with its last account.** `remove_account` of a seed's last
+  account sends `forget_seed({ seed: fingerprint })` (`logos.wallets/1`), asked without waiting; QR
+  Wallets' "Forget wallet" removes each account. The manager drops this holder, and the wallet once
+  no holder is left. A failed removal sends nothing, and a refusal is only logged.
+  - On each read of `wallets()`, the module also forgets, once a run, each wallet the manager lists
+    it holding that it no longer has, sealed, open or waiting. So a wallet forgotten before this
+    goes too.
+  - Only a store read from an earlier run's `accounts.sealed.json` counts. One that failed to load,
+    or found no file, forgets nothing.
 - **`unlock_key`** (`{ seed, index }`, the signer manager alone) returns a job in `confirm_on_device`
   while the request shows and its answer is read, in a scanner session titled "Unlock with your QR
   wallet <fingerprint>", the fingerprint QR Wallets shows, so whichever app draws signing sessions draws
@@ -114,7 +123,7 @@ For the app:
 | `scan_accounts` | `{ families, labels?, label?, profile? }` | `{ ok, job }`. Reads the wallet's account code and offers an account of each family it holds: `evm`, `bitcoin` (native segwit, BIP84) and `bitcoin_taproot` (BIP86). `labels` names each account by its family (`{ "bitcoin": "Savings" }`), up to 80 characters; an account it doesn't name has none, and apps show its kind. `label` names the one account of a scan that asks for one family; one name for several accounts is refused (`invalid`) |
 | `add_status` | `job` | `{ ok, job, state, step?, accounts, unlockKey?, error? }`, `state` being `scanning`, `done`, `failed` or `cancelled`. While scanning, `step` is `account_code`, then `unlock_key` while the seed's unlock key is asked for; once done, `unlockKey` says whether the wallet gave it |
 | `cancel_scan` | `job` | `{ ok, cancelled }`, whether the scan was still running |
-| `remove_account` | `id` | `{ ok, removed }`. Nothing on the wallet changes |
+| `remove_account` | `id` | `{ ok, removed }`. Nothing on the wallet changes. A wallet's last account takes the wallet from the signer manager too |
 | `rename_account` | `id, label` | `{ ok, renamed }`. The name apps see, up to 80 characters; blank clears it |
 | `wallets` | | `{ ok, wallets: [{ fingerprint, profile, label, name, unlockKey?, wayIn? }] }`: each wallet accounts came from, by master fingerprint, the profile it follows and the name given to it. Once the signer manager says, `unlockKey` is whether its wallet there has the seed's unlock key and `wayIn` whether any way in opens it after a restart |
 | `give_unlock_key` | `seed` | `{ ok, job }`. A Keycard Shell added without its seed's unlock key gives it now; `add_status` and `cancel_scan` take the job |

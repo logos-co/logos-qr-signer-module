@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use logos_signer_interface::json as signer_json;
 use logos_signer_interface::wallets::{
-    name_steps, read_data_key, read_wallets, DataKey, DataKeyRequest, NameSeed, NameStep,
+    name_steps, read_data_key, read_forgotten, read_wallets, DataKey, DataKeyRequest, ForgetSeed,
+    NameSeed, NameStep,
 };
 use logos_signer_interface::JobState;
 use serde_json::{json, Value};
@@ -135,6 +136,9 @@ impl Events for Emit {
     fn seed_named(&self, seed: &str, name: &str) {
         send_name(seed, name);
     }
+    fn seed_forgotten(&self, seed: &str) {
+        forget_seed(seed);
+    }
     fn sign_progress(&self, job: &str, state: JobState) {
         if !UNLOADING.load(Ordering::SeqCst) {
             emit_sign_progress(job, state.as_str());
@@ -198,7 +202,7 @@ fn open_wallets(qr: &QrSigner) {
         if let Some(statuses) = seed_statuses(&raw) {
             qr.set_seed_statuses(statuses);
         }
-        sync_names(qr, &raw);
+        sync_wallets(qr, &raw);
     }
 }
 
@@ -217,13 +221,35 @@ fn manager_wallets() -> Option<String> {
 /// Seeds whose name went to the manager this run: each goes once.
 static SENT_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// One name per wallet: take the name the person gave in any app, and send one given here while
-/// the wallet has none.
-fn sync_names(qr: &QrSigner, raw: &str) {
-    let Ok(listed) = read_wallets(raw) else {
+/// Seeds the manager was told to forget for being stale this run: each goes once.
+static FORGOT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The manager's wallets: a wallet that went here before the manager heard of it is forgotten
+/// there, and the others' names brought together.
+fn sync_wallets(qr: &QrSigner, raw: &str) {
+    let Ok(mut listed) = read_wallets(raw) else {
         return;
     };
-    for step in name_steps(&listed, |fp| qr.wallet_name(&fp.to_ascii_lowercase())) {
+    let stale = qr.stale_wallets(&listed);
+    for seed in &stale {
+        let mut forgot = FORGOT.lock().unwrap_or_else(|e| e.into_inner());
+        if !forgot.contains(seed) {
+            forgot.push(seed.clone());
+            forget_seed(seed);
+        }
+    }
+    listed.retain(|w| {
+        !w.holder_seed
+            .as_deref()
+            .is_some_and(|s| stale.iter().any(|g| g == s.trim()))
+    });
+    sync_names(qr, &listed);
+}
+
+/// One name per wallet: take the name the person gave in any app, and send one given here while
+/// the wallet has none.
+fn sync_names(qr: &QrSigner, listed: &[logos_signer_interface::wallets::Wallet]) {
+    for step in name_steps(listed, |fp| qr.wallet_name(&fp.to_ascii_lowercase())) {
         match step {
             NameStep::Take { seed, name } => {
                 if let Err(e) = qr.take_wallet_name(&seed, &name) {
@@ -255,6 +281,25 @@ fn send_name(seed: &str, name: &str) {
     if let Ok(body) = serde_json::to_string(&body) {
         wallets::WalletsClient::bind(WALLETS).name_seed_async(&body, |_| {});
     }
+}
+
+/// This module no longer holds the seed: the manager drops it, and the wallet with no holder
+/// left. Asked without waiting; a refusal is only logged.
+fn forget_seed(seed: &str) {
+    if UNLOADING.load(Ordering::SeqCst) {
+        return;
+    }
+    let Ok(body) = serde_json::to_string(&ForgetSeed { seed: seed.into() }) else {
+        return;
+    };
+    wallets::WalletsClient::bind(WALLETS).forget_seed_async(&body, |r| {
+        let forgotten = r
+            .map_err(|e| e.to_string())
+            .and_then(|r| read_forgotten(&r).map_err(|e| e.message));
+        if let Err(e) = forgotten {
+            eprintln!("qr_signer_module: the signer manager didn't forget a wallet: {e}");
+        }
+    });
 }
 
 /// What the signer manager says of the wallets of this module's seeds, by seed. A manager that
