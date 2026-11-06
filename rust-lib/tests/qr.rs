@@ -111,6 +111,7 @@ struct Heard(
     Arc<Mutex<Vec<Enrolled>>>,
     Arc<Mutex<Option<String>>>,
     Arc<Mutex<Vec<(String, String)>>>,
+    Arc<Mutex<Vec<String>>>,
 );
 
 impl Events for Heard {
@@ -134,6 +135,9 @@ impl Events for Heard {
     }
     fn seed_named(&self, seed: &str, name: &str) {
         self.3.lock().unwrap().push((seed.into(), name.into()));
+    }
+    fn seed_forgotten(&self, seed: &str) {
+        self.4.lock().unwrap().push(seed.into());
     }
 }
 
@@ -888,6 +892,70 @@ fn a_wallet_is_named_and_its_accounts_say_where_they_come_from() {
         None,
         "the name goes with the wallet's last account"
     );
+}
+
+#[test]
+fn a_wallet_leaves_the_manager_with_its_last_account() {
+    let r = rig(Emulator::default(), Store::new(), Duration::from_secs(20));
+    scan_all(&r.signer);
+    let seed = seed_of(&r.signer);
+    let mut ids: Vec<String> = r
+        .signer
+        .offered()
+        .iter()
+        .map(|o| o.account.id.clone())
+        .collect();
+    let last = ids.pop().unwrap();
+    for id in ids {
+        r.signer.remove_account(&id).unwrap();
+    }
+    assert!(!r.signer.remove_account("nope").unwrap());
+    assert!(r.heard.4.lock().unwrap().is_empty(), "an account is left");
+    assert!(r.signer.remove_account(&last).unwrap());
+    assert_eq!(*r.heard.4.lock().unwrap(), vec![seed]);
+}
+
+/// The manager's `wallets()` listing this module holding `held`, and another holder's wallet.
+fn listed(held: &[&str]) -> Vec<logos_signer_interface::wallets::Wallet> {
+    let mut wallets: Vec<_> = held
+        .iter()
+        .map(|s| serde_json::json!({ "seed": format!("w_{s}"), "name": s, "locked": true, "holderSeed": s }))
+        .collect();
+    wallets.push(serde_json::json!({ "seed": "w_other", "name": "Keycard", "locked": false }));
+    let reply = serde_json::json!({ "ok": true, "wallets": wallets }).to_string();
+    logos_signer_interface::wallets::read_wallets(&reply).unwrap()
+}
+
+#[test]
+fn stale_wallets_are_the_held_ones_the_store_no_longer_has() {
+    let d = dir("stale");
+    let r = rig(
+        Emulator::default(),
+        Store::open(&d).unwrap(),
+        Duration::from_secs(20),
+    );
+    scan_all(&r.signer);
+    let seed = seed_of(&r.signer);
+    r.signer
+        .open_seed(&seed, &data_key(1, 0), &data_key(1, 0))
+        .unwrap();
+    let upper = seed.to_uppercase();
+    let all = listed(&[&upper, "0badf00d", " 5eed0000 "]);
+    // Sealed and locked, it is still had, its fingerprint in either case.
+    let reopened = Store::open(&d).unwrap();
+    assert_eq!(reopened.stale(&all), vec!["0badf00d", "5eed0000"]);
+    let again = rig(Emulator::default(), reopened, Duration::from_secs(20));
+    assert_eq!(
+        again.signer.stale_wallets(&all),
+        vec!["0badf00d", "5eed0000"]
+    );
+    // A store read from no file, or kept in memory, forgets nothing.
+    assert!(Store::open(dir("stale-empty"))
+        .unwrap()
+        .stale(&all)
+        .is_empty());
+    assert!(Store::new().stale(&all).is_empty());
+    let _ = std::fs::remove_dir_all(d);
 }
 
 /// A module's key for a seed's data, as the signer manager gives it.

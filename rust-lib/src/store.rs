@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use logos_signer_interface::sealed::SealedDocs;
-use logos_signer_interface::wallets::DataKey;
+use logos_signer_interface::wallets::{self, stale_seeds, DataKey};
 use logos_signer_interface::{Account, SignerError};
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,8 @@ pub struct Store {
     wallets: BTreeMap<String, String>,
     /// Added while their seed was sealed and locked: merged in, and saved, once it unlocks.
     waiting: BTreeMap<String, Vec<Offered>>,
+    /// Read from a file an earlier run wrote: only then does a missing wallet mean forgotten.
+    found: bool,
 }
 
 impl Default for Store {
@@ -50,6 +52,7 @@ impl Default for Store {
             offered: Vec::new(),
             wallets: BTreeMap::new(),
             waiting: BTreeMap::new(),
+            found: false,
         }
     }
 }
@@ -63,10 +66,12 @@ impl Store {
     /// Read `dir/accounts.sealed.json`, kept there from now on. A missing file is an empty list.
     /// Each seed's document stays sealed until its key arrives ([`Store::unlock`]).
     pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
-        let docs =
-            SealedDocs::load(dir.into().join("accounts.sealed.json"), WALLETS).map_err(io)?;
+        let path = dir.into().join("accounts.sealed.json");
+        let found = path.exists();
+        let docs = SealedDocs::load(path, WALLETS).map_err(io)?;
         Ok(Store {
             docs,
+            found,
             ..Store::default()
         })
     }
@@ -141,6 +146,15 @@ impl Store {
         self.offered.iter().any(|o| seed_of(o) == seed)
             || self.docs.seeds().iter().any(|s| s == seed)
             || self.waiting.contains_key(seed)
+    }
+
+    /// The wallets the signer manager lists this module holding that the store no longer has.
+    /// None unless the store was read from a run's file, so an empty read forgets nothing.
+    pub fn stale(&self, listed: &[wallets::Wallet]) -> Vec<String> {
+        if !self.found {
+            return Vec::new();
+        }
+        stale_seeds(listed, |seed| self.knows(&seed.to_ascii_lowercase()))
     }
 
     pub fn find(&self, id: &str) -> Option<&Offered> {
